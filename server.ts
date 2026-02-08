@@ -1,10 +1,7 @@
 import type { Logger } from "./logger.ts";
 import type {
-  RealityConfig,
   ShadowsocksConfig,
   TrojanConfig,
-  WireguardConfig,
-  ZuiVpnConfig,
   ProtocolCommandConfig,
 } from "./config.ts";
 import { isValidUUID } from "./utils.ts";
@@ -13,11 +10,8 @@ export type VlessServerOptions = {
   port: number;
   uuid: string;
   masqueradeUrl: string;
-  reality: RealityConfig;
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
-  wireguard: WireguardConfig;
-  zuivpn: ZuiVpnConfig;
   protocolCommands: ProtocolCommandConfig;
   errorLogBuffer: string[];
   logger?: Logger;
@@ -80,17 +74,6 @@ export function startVlessServer(options: VlessServerOptions): void {
     logger,
     options.protocolCommands.trojan,
   );
-  startTcpProtocolService(
-    "zuivpn",
-    options.zuivpn.port,
-    logger,
-    options.protocolCommands.zuivpn,
-  );
-  startWireguardService(
-    options.wireguard,
-    logger,
-    options.protocolCommands.wireguard,
-  );
 
   Deno.serve({ port: options.port }, async (req) => {
     if (isMemoryPressure(MEMORY_USAGE_LIMIT)) {
@@ -129,11 +112,8 @@ export function startVlessServer(options: VlessServerOptions): void {
           options.uuid,
           url.hostname,
           port,
-          options.reality,
           options.shadowsocks,
           options.trojan,
-          options.wireguard,
-          options.zuivpn,
         );
         return new Response(`${vlessConfig}`, {
           status: 200,
@@ -146,11 +126,8 @@ export function startVlessServer(options: VlessServerOptions): void {
           options.uuid,
           url.hostname,
           port,
-          options.reality,
           options.shadowsocks,
           options.trojan,
-          options.wireguard,
-          options.zuivpn,
         );
         return new Response(`${vlessConfig}`, {
           status: 200,
@@ -429,16 +406,11 @@ function getVLESSConfig(
   userID: string,
   hostName: string,
   port: string,
-  reality: RealityConfig,
   shadowsocks: ShadowsocksConfig,
   trojan: TrojanConfig,
-  wireguard: WireguardConfig,
-  zuivpn: ZuiVpnConfig,
 ): string {
   const vlessMain =
     `vless://${userID}\u0040${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
-  const realityClientLink =
-    `vless://${userID}\u0040${hostName}:443?encryption=none&security=reality&sni=${reality.serverName}&fp=${reality.fingerprint}&pbk=${reality.publicKey}&sid=${reality.shortId}&type=tcp&flow=xtls-rprx-vision#${hostName}-reality`;
   const shadowsocksUserInfo = base64Encode(
     `${shadowsocks.method}:${shadowsocks.password}`,
   );
@@ -446,59 +418,11 @@ function getVLESSConfig(
     `ss://${shadowsocksUserInfo}\u0040${hostName}:${shadowsocks.port}#${hostName}-ss`;
   const trojanLink =
     `trojan://${trojan.password}\u0040${hostName}:${trojan.port}?sni=${hostName}&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}-trojan`;
-  const realityServerConfig = JSON.stringify(
-    {
-      log: {
-        loglevel: "none",
-        access: "",
-        error: "",
-      },
-      inbounds: [
-        {
-          port: 443,
-          protocol: "vless",
-          settings: {
-            clients: [
-              {
-                id: userID,
-                flow: "xtls-rprx-vision",
-              },
-            ],
-            decryption: "none",
-          },
-          streamSettings: {
-            network: "tcp",
-            security: "reality",
-            realitySettings: {
-              show: false,
-              dest: reality.dest,
-              xver: 0,
-              serverNames: [reality.serverName],
-              privateKey: reality.privateKey,
-              shortIds: [reality.shortId],
-            },
-          },
-          sniffing: {
-            enabled: false,
-          },
-        },
-      ],
-      outbounds: [
-        {
-          protocol: "freedom",
-          settings: {},
-        },
-      ],
-    },
-    null,
-    2,
-  );
   return `
 ################################################################
 v2ray
 ---------------------------------------------------------------
 ${vlessMain}
-${realityClientLink}
 ${shadowsocksLink}
 ${trojanLink}
 ---------------------------------------------------------------
@@ -542,46 +466,6 @@ clash-meta
       host: ${hostName}
 ---------------------------------------------------------------
 ################################################################
-xtls-reality (xray server)
----------------------------------------------------------------
-${realityServerConfig}
----------------------------------------------------------------
-################################################################
-wireguard
----------------------------------------------------------------
-[Interface]
-PrivateKey = ${wireguard.clientPrivateKey}
-Address = ${wireguard.clientAddress}
-DNS = ${wireguard.dns}
-
-[Peer]
-PublicKey = ${wireguard.serverPublicKey}
-PresharedKey = ${wireguard.presharedKey}
-Endpoint = ${hostName}:${wireguard.port}
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
----------------------------------------------------------------
-wireguard-server
----------------------------------------------------------------
-[Interface]
-PrivateKey = ${wireguard.serverPrivateKey}
-Address = ${wireguard.serverAddress}
-ListenPort = ${wireguard.port}
-
-[Peer]
-PublicKey = ${wireguard.clientPublicKey}
-PresharedKey = ${wireguard.presharedKey}
-AllowedIPs = ${wireguard.clientAddress}
----------------------------------------------------------------
-################################################################
-zuivpn
----------------------------------------------------------------
-username: ${zuivpn.username}
-password: ${zuivpn.password}
-server: ${hostName}
-port: ${zuivpn.port}
----------------------------------------------------------------
-################################################################
 `;
 }
 
@@ -600,74 +484,6 @@ function startTcpProtocolService(
     return;
   }
   startTcpProtocolListener(name, port, logger);
-}
-
-function startUdpProtocolService(
-  name: string,
-  port: number,
-  logger: Logger,
-  command?: string,
-) {
-  if (command?.trim()) {
-    startExternalCommand(name, command, logger);
-    return;
-  }
-  startUdpProtocolListener(name, port, logger);
-}
-
-function startWireguardService(
-  wireguard: WireguardConfig,
-  logger: Logger,
-  command?: string,
-) {
-  if (command?.trim()) {
-    startExternalCommand("wireguard", command, logger);
-    return;
-  }
-  const started = startWireguardTunnel(wireguard, logger);
-  if (!started) {
-    startUdpProtocolListener("wireguard", wireguard.port, logger);
-  }
-}
-
-function startWireguardTunnel(
-  wireguard: WireguardConfig,
-  logger: Logger,
-): boolean {
-  const config = `[Interface]
-PrivateKey = ${wireguard.serverPrivateKey}
-Address = ${wireguard.serverAddress}
-ListenPort = ${wireguard.port}
-
-[Peer]
-PublicKey = ${wireguard.clientPublicKey}
-PresharedKey = ${wireguard.presharedKey}
-AllowedIPs = ${wireguard.clientAddress}
-`;
-  const configPath = `/tmp/wireguard-${wireguard.port}.conf`;
-  try {
-    Deno.writeTextFileSync(configPath, config);
-  } catch (error) {
-    logger.warn(
-      "Failed to write WireGuard config, falling back to UDP listener",
-      error,
-    );
-    return false;
-  }
-
-  try {
-    const process = new Deno.Command("wg-quick", {
-      args: ["up", configPath],
-      stdin: "null",
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
-    pipeProcessOutput(process, "wireguard", logger);
-    return true;
-  } catch (error) {
-    logger.warn("wg-quick not available, falling back to UDP listener", error);
-    return false;
-  }
 }
 
 function startExternalCommand(
@@ -792,31 +608,6 @@ function startTcpProtocolListener(
   });
 }
 
-function startUdpProtocolListener(
-  name: string,
-  port: number,
-  logger: Logger,
-) {
-  let socket: Deno.DatagramConn;
-  try {
-    socket = Deno.listenDatagram({
-      port,
-      transport: "udp",
-    });
-  } catch (error) {
-    logger.warn(`${name} UDP listener failed to start on :${port}`, error);
-    return;
-  }
-  logger.info(`${name} UDP listener running on :${port}`);
-  (async () => {
-    for await (const _packet of socket) {
-      // Intentionally ignore packets to keep port open.
-    }
-  })().catch((error) => {
-    logger.error(`${name} UDP listener failed`, error);
-  });
-}
-
 function formatErrorLogs(errorLogBuffer: string[]): string {
   if (errorLogBuffer.length === 0) {
     return "No errors recorded.";
@@ -841,31 +632,12 @@ function formatServerInfo(options: VlessServerOptions): string {
       port: options.port,
       uuid: options.uuid,
       masqueradeUrl: options.masqueradeUrl,
-      reality: {
-        serverName: options.reality.serverName,
-        dest: options.reality.dest,
-        shortId: options.reality.shortId,
-        fingerprint: options.reality.fingerprint,
-        publicKey: options.reality.publicKey,
-      },
       shadowsocks: {
         port: options.shadowsocks.port,
         method: options.shadowsocks.method,
       },
       trojan: {
         port: options.trojan.port,
-      },
-      wireguard: {
-        port: options.wireguard.port,
-        clientAddress: options.wireguard.clientAddress,
-        serverAddress: options.wireguard.serverAddress,
-        dns: options.wireguard.dns,
-        clientPublicKey: options.wireguard.clientPublicKey,
-        serverPublicKey: options.wireguard.serverPublicKey,
-      },
-      zuivpn: {
-        port: options.zuivpn.port,
-        username: options.zuivpn.username,
       },
       protocolCommands: options.protocolCommands,
     },
