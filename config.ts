@@ -120,6 +120,24 @@ function base64Encode(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function base64Decode(value: string): Uint8Array | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
 function base64UrlEncode(bytes: Uint8Array): string {
   return base64Encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
@@ -258,6 +276,63 @@ async function generateX25519KeyPair(): Promise<KeyPair> {
   };
 }
 
+async function deriveX25519PublicKey(
+  privateKeyBase64: string,
+): Promise<string | null> {
+  const rawPrivateKey = base64Decode(privateKeyBase64);
+  if (!rawPrivateKey || rawPrivateKey.length !== 32) {
+    return null;
+  }
+  const pkcs8Prefix = Uint8Array.from([
+    0x30,
+    0x2e,
+    0x02,
+    0x01,
+    0x00,
+    0x30,
+    0x05,
+    0x06,
+    0x03,
+    0x2b,
+    0x65,
+    0x6e,
+    0x04,
+    0x22,
+    0x04,
+    0x20,
+  ]);
+  const pkcs8Key = new Uint8Array(pkcs8Prefix.length + rawPrivateKey.length);
+  pkcs8Key.set(pkcs8Prefix);
+  pkcs8Key.set(rawPrivateKey, pkcs8Prefix.length);
+
+  try {
+    const privateKey = await crypto.subtle.importKey(
+      "pkcs8",
+      pkcs8Key,
+      { name: "X25519", namedCurve: "X25519" },
+      true,
+      ["deriveBits"],
+    );
+    const basepoint = new Uint8Array(32);
+    basepoint[0] = 9;
+    const publicKey = await crypto.subtle.importKey(
+      "raw",
+      basepoint,
+      { name: "X25519", namedCurve: "X25519" },
+      true,
+      [],
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: "X25519", public: publicKey },
+      privateKey,
+      256,
+    );
+    return base64Encode(new Uint8Array(bits));
+  } catch {
+    return null;
+  }
+}
+
 export async function loadConfig(): Promise<AppConfig> {
   const uuid = readEnv("UUID") ?? DEFAULT_UUID;
   const port = parsePort(readEnv("PORT"), DEFAULT_PORT);
@@ -316,33 +391,67 @@ export async function loadConfig(): Promise<AppConfig> {
     DEFAULT_WIREGUARD_PRIVATE_KEY;
   const rawWireguardPublicKey = readEnv("WIREGUARD_PUBLIC_KEY") ??
     DEFAULT_WIREGUARD_PUBLIC_KEY;
-  const shouldGenerateWireguardKeys = isPlaceholder(
+  let wireguardKeyPair: KeyPair | null = null;
+  const hasWireguardPrivateKey = !isPlaceholder(
     rawWireguardPrivateKey,
     DEFAULT_WIREGUARD_PRIVATE_KEY,
-  ) || isPlaceholder(rawWireguardPublicKey, DEFAULT_WIREGUARD_PUBLIC_KEY);
-  const wireguardKeyPair = shouldGenerateWireguardKeys
-    ? await generateX25519KeyPair()
-    : {
-      privateKey: rawWireguardPrivateKey,
-      publicKey: rawWireguardPublicKey,
-    };
+  );
+  const hasWireguardPublicKey = !isPlaceholder(
+    rawWireguardPublicKey,
+    DEFAULT_WIREGUARD_PUBLIC_KEY,
+  );
+  if (hasWireguardPrivateKey) {
+    if (hasWireguardPublicKey) {
+      wireguardKeyPair = {
+        privateKey: rawWireguardPrivateKey,
+        publicKey: rawWireguardPublicKey,
+      };
+    } else {
+      const derivedPublicKey = await deriveX25519PublicKey(
+        rawWireguardPrivateKey,
+      );
+      wireguardKeyPair = derivedPublicKey
+        ? { privateKey: rawWireguardPrivateKey, publicKey: derivedPublicKey }
+        : null;
+    }
+  }
+  if (!wireguardKeyPair) {
+    wireguardKeyPair = await generateX25519KeyPair();
+  }
   const rawWireguardServerPrivateKey = readEnv("WIREGUARD_SERVER_PRIVATE_KEY") ??
     DEFAULT_WIREGUARD_SERVER_PRIVATE_KEY;
   const rawWireguardServerPublicKey = readEnv("WIREGUARD_SERVER_PUBLIC_KEY") ??
     DEFAULT_WIREGUARD_SERVER_PUBLIC_KEY;
-  const shouldGenerateWireguardServerKeys = isPlaceholder(
+  let wireguardServerKeyPair: KeyPair | null = null;
+  const hasWireguardServerPrivateKey = !isPlaceholder(
     rawWireguardServerPrivateKey,
     DEFAULT_WIREGUARD_SERVER_PRIVATE_KEY,
-  ) || isPlaceholder(
+  );
+  const hasWireguardServerPublicKey = !isPlaceholder(
     rawWireguardServerPublicKey,
     DEFAULT_WIREGUARD_SERVER_PUBLIC_KEY,
   );
-  const wireguardServerKeyPair = shouldGenerateWireguardServerKeys
-    ? await generateX25519KeyPair()
-    : {
-      privateKey: rawWireguardServerPrivateKey,
-      publicKey: rawWireguardServerPublicKey,
-    };
+  if (hasWireguardServerPrivateKey) {
+    if (hasWireguardServerPublicKey) {
+      wireguardServerKeyPair = {
+        privateKey: rawWireguardServerPrivateKey,
+        publicKey: rawWireguardServerPublicKey,
+      };
+    } else {
+      const derivedPublicKey = await deriveX25519PublicKey(
+        rawWireguardServerPrivateKey,
+      );
+      wireguardServerKeyPair = derivedPublicKey
+        ? {
+          privateKey: rawWireguardServerPrivateKey,
+          publicKey: derivedPublicKey,
+        }
+        : null;
+    }
+  }
+  if (!wireguardServerKeyPair) {
+    wireguardServerKeyPair = await generateX25519KeyPair();
+  }
   const rawWireguardPresharedKey = readEnv("WIREGUARD_PRESHARED_KEY") ??
     DEFAULT_WIREGUARD_PRESHARED_KEY;
   const wireguardPresharedKey = isPlaceholder(
