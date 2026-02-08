@@ -37,10 +37,13 @@ export type TrojanConfig = {
 };
 
 export type WireguardConfig = {
-  privateKey: string;
-  publicKey: string;
+  clientPrivateKey: string;
+  clientPublicKey: string;
+  serverPrivateKey: string;
+  serverPublicKey: string;
   presharedKey: string;
-  address: string;
+  clientAddress: string;
+  serverAddress: string;
   dns: string;
   port: number;
 };
@@ -75,8 +78,12 @@ const DEFAULT_TROJAN_PASSWORD = "REPLACE_WITH_TROJAN_PASSWORD";
 const DEFAULT_TROJAN_PORT = 443;
 const DEFAULT_WIREGUARD_PRIVATE_KEY = "REPLACE_WITH_WG_PRIVATE_KEY";
 const DEFAULT_WIREGUARD_PUBLIC_KEY = "REPLACE_WITH_WG_PUBLIC_KEY";
+const DEFAULT_WIREGUARD_SERVER_PRIVATE_KEY =
+  "REPLACE_WITH_WG_SERVER_PRIVATE_KEY";
+const DEFAULT_WIREGUARD_SERVER_PUBLIC_KEY = "REPLACE_WITH_WG_SERVER_PUBLIC_KEY";
 const DEFAULT_WIREGUARD_PRESHARED_KEY = "REPLACE_WITH_WG_PRESHARED_KEY";
 const DEFAULT_WIREGUARD_ADDRESS = "10.0.0.2/32";
+const DEFAULT_WIREGUARD_SERVER_ADDRESS = "10.0.0.1/24";
 const DEFAULT_WIREGUARD_DNS = "8.8.8.8";
 const DEFAULT_WIREGUARD_PORT = 51820;
 const DEFAULT_ZUIVPN_USERNAME = "REPLACE_WITH_ZUIVPN_USERNAME";
@@ -247,6 +254,23 @@ export async function loadConfig(): Promise<AppConfig> {
       privateKey: rawWireguardPrivateKey,
       publicKey: rawWireguardPublicKey,
     };
+  const rawWireguardServerPrivateKey = readEnv("WIREGUARD_SERVER_PRIVATE_KEY") ??
+    DEFAULT_WIREGUARD_SERVER_PRIVATE_KEY;
+  const rawWireguardServerPublicKey = readEnv("WIREGUARD_SERVER_PUBLIC_KEY") ??
+    DEFAULT_WIREGUARD_SERVER_PUBLIC_KEY;
+  const shouldGenerateWireguardServerKeys = isPlaceholder(
+    rawWireguardServerPrivateKey,
+    DEFAULT_WIREGUARD_SERVER_PRIVATE_KEY,
+  ) || isPlaceholder(
+    rawWireguardServerPublicKey,
+    DEFAULT_WIREGUARD_SERVER_PUBLIC_KEY,
+  );
+  const wireguardServerKeyPair = shouldGenerateWireguardServerKeys
+    ? await generateX25519KeyPair()
+    : {
+      privateKey: rawWireguardServerPrivateKey,
+      publicKey: rawWireguardServerPublicKey,
+    };
   const rawWireguardPresharedKey = readEnv("WIREGUARD_PRESHARED_KEY") ??
     DEFAULT_WIREGUARD_PRESHARED_KEY;
   const wireguardPresharedKey = isPlaceholder(
@@ -257,10 +281,14 @@ export async function loadConfig(): Promise<AppConfig> {
     : rawWireguardPresharedKey;
   const serverDns = await readServerDns();
   const wireguard: WireguardConfig = {
-    privateKey: wireguardKeyPair.privateKey,
-    publicKey: wireguardKeyPair.publicKey,
+    clientPrivateKey: wireguardKeyPair.privateKey,
+    clientPublicKey: wireguardKeyPair.publicKey,
+    serverPrivateKey: wireguardServerKeyPair.privateKey,
+    serverPublicKey: wireguardServerKeyPair.publicKey,
     presharedKey: wireguardPresharedKey,
-    address: readEnv("WIREGUARD_ADDRESS") ?? DEFAULT_WIREGUARD_ADDRESS,
+    clientAddress: readEnv("WIREGUARD_ADDRESS") ?? DEFAULT_WIREGUARD_ADDRESS,
+    serverAddress: readEnv("WIREGUARD_SERVER_ADDRESS") ??
+      DEFAULT_WIREGUARD_SERVER_ADDRESS,
     dns: readEnv("WIREGUARD_DNS") ?? serverDns ?? DEFAULT_WIREGUARD_DNS,
     port: parsePort(readEnv("WIREGUARD_PORT"), DEFAULT_WIREGUARD_PORT),
   };

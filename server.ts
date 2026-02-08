@@ -86,9 +86,8 @@ export function startVlessServer(options: VlessServerOptions): void {
     logger,
     options.protocolCommands.zuivpn,
   );
-  startUdpProtocolService(
-    "wireguard",
-    options.wireguard.port,
+  startWireguardService(
+    options.wireguard,
     logger,
     options.protocolCommands.wireguard,
   );
@@ -541,16 +540,28 @@ ${realityServerConfig}
 wireguard
 ---------------------------------------------------------------
 [Interface]
-PrivateKey = ${wireguard.privateKey}
-Address = ${wireguard.address}
+PrivateKey = ${wireguard.clientPrivateKey}
+Address = ${wireguard.clientAddress}
 DNS = ${wireguard.dns}
 
 [Peer]
-PublicKey = ${wireguard.publicKey}
+PublicKey = ${wireguard.serverPublicKey}
 PresharedKey = ${wireguard.presharedKey}
 Endpoint = ${hostName}:${wireguard.port}
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
+---------------------------------------------------------------
+wireguard-server
+---------------------------------------------------------------
+[Interface]
+PrivateKey = ${wireguard.serverPrivateKey}
+Address = ${wireguard.serverAddress}
+ListenPort = ${wireguard.port}
+
+[Peer]
+PublicKey = ${wireguard.clientPublicKey}
+PresharedKey = ${wireguard.presharedKey}
+AllowedIPs = ${wireguard.clientAddress}
 ---------------------------------------------------------------
 ################################################################
 zuivpn
@@ -592,6 +603,61 @@ function startUdpProtocolService(
     return;
   }
   startUdpProtocolListener(name, port, logger);
+}
+
+function startWireguardService(
+  wireguard: WireguardConfig,
+  logger: Logger,
+  command?: string,
+) {
+  if (command?.trim()) {
+    startExternalCommand("wireguard", command, logger);
+    return;
+  }
+  const started = startWireguardTunnel(wireguard, logger);
+  if (!started) {
+    startUdpProtocolListener("wireguard", wireguard.port, logger);
+  }
+}
+
+function startWireguardTunnel(
+  wireguard: WireguardConfig,
+  logger: Logger,
+): boolean {
+  const config = `[Interface]
+PrivateKey = ${wireguard.serverPrivateKey}
+Address = ${wireguard.serverAddress}
+ListenPort = ${wireguard.port}
+
+[Peer]
+PublicKey = ${wireguard.clientPublicKey}
+PresharedKey = ${wireguard.presharedKey}
+AllowedIPs = ${wireguard.clientAddress}
+`;
+  const configPath = `/tmp/wireguard-${wireguard.port}.conf`;
+  try {
+    Deno.writeTextFileSync(configPath, config);
+  } catch (error) {
+    logger.warn(
+      "Failed to write WireGuard config, falling back to UDP listener",
+      error,
+    );
+    return false;
+  }
+
+  try {
+    const process = new Deno.Command("wg-quick", {
+      args: ["up", configPath],
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    pipeProcessOutput(process, "wireguard", logger);
+    return true;
+  } catch (error) {
+    logger.warn("wg-quick not available, falling back to UDP listener", error);
+    return false;
+  }
 }
 
 function startExternalCommand(
