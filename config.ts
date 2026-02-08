@@ -11,6 +11,7 @@ export type AppConfig = {
   trojan: TrojanConfig;
   wireguard: WireguardConfig;
   zuivpn: ZuiVpnConfig;
+  protocolCommands: ProtocolCommandConfig;
   errorLogBuffer: string[];
   logger: Logger;
 };
@@ -48,6 +49,13 @@ export type ZuiVpnConfig = {
   username: string;
   password: string;
   port: number;
+};
+
+export type ProtocolCommandConfig = {
+  shadowsocks?: string;
+  trojan?: string;
+  wireguard?: string;
+  zuivpn?: string;
 };
 
 const DEFAULT_UUID = "841b9534-793e-4363-9976-59915e6659f4";
@@ -261,6 +269,12 @@ export async function loadConfig(): Promise<AppConfig> {
     password: zuivpnPassword,
     port: parsePort(readEnv("ZUIVPN_PORT"), DEFAULT_ZUIVPN_PORT),
   };
+  const protocolCommands: ProtocolCommandConfig = {
+    shadowsocks: readEnv("SHADOWSOCKS_COMMAND"),
+    trojan: readEnv("TROJAN_COMMAND"),
+    wireguard: readEnv("WIREGUARD_COMMAND"),
+    zuivpn: readEnv("ZUIVPN_COMMAND"),
+  };
 
   if (!isValidUUID(uuid)) {
     throw new Error(`UUID is not valid: ${uuid}`);
@@ -285,6 +299,7 @@ export async function loadConfig(): Promise<AppConfig> {
     trojan,
     wireguard,
     zuivpn,
+    protocolCommands,
     errorLogBuffer,
     logger,
   };

@@ -12,6 +12,7 @@ startVlessServer({
   trojan: config.trojan,
   wireguard: config.wireguard,
   zuivpn: config.zuivpn,
+  protocolCommands: config.protocolCommands,
   errorLogBuffer: config.errorLogBuffer,
   logger: config.logger,
 });

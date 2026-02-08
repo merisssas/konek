@@ -5,6 +5,7 @@ import type {
   TrojanConfig,
   WireguardConfig,
   ZuiVpnConfig,
+  ProtocolCommandConfig,
 } from "./config.ts";
 import { isValidUUID } from "./utils.ts";
 
@@ -17,6 +18,7 @@ export type VlessServerOptions = {
   trojan: TrojanConfig;
   wireguard: WireguardConfig;
   zuivpn: ZuiVpnConfig;
+  protocolCommands: ProtocolCommandConfig;
   errorLogBuffer: string[];
   logger?: Logger;
 };
@@ -66,10 +68,30 @@ export function startVlessServer(options: VlessServerOptions): void {
   const logger = options.logger ?? console;
   const validUUIDBytes = uuidToBytes(options.uuid);
   logger.info(`VLESS server listening on :${options.port}`);
-  startTcpProtocolListener("shadowsocks", options.shadowsocks.port, logger);
-  startTcpProtocolListener("trojan", options.trojan.port, logger);
-  startTcpProtocolListener("zuivpn", options.zuivpn.port, logger);
-  startUdpProtocolListener("wireguard", options.wireguard.port, logger);
+  startTcpProtocolService(
+    "shadowsocks",
+    options.shadowsocks.port,
+    logger,
+    options.protocolCommands.shadowsocks,
+  );
+  startTcpProtocolService(
+    "trojan",
+    options.trojan.port,
+    logger,
+    options.protocolCommands.trojan,
+  );
+  startTcpProtocolService(
+    "zuivpn",
+    options.zuivpn.port,
+    logger,
+    options.protocolCommands.zuivpn,
+  );
+  startUdpProtocolService(
+    "wireguard",
+    options.wireguard.port,
+    logger,
+    options.protocolCommands.wireguard,
+  );
 
   Deno.serve({ port: options.port }, async (req) => {
     if (isMemoryPressure(MEMORY_USAGE_LIMIT)) {
@@ -544,6 +566,132 @@ port: ${zuivpn.port}
 
 function base64Encode(value: string): string {
   return btoa(value);
+}
+
+function startTcpProtocolService(
+  name: string,
+  port: number,
+  logger: Logger,
+  command?: string,
+) {
+  if (command?.trim()) {
+    startExternalCommand(name, command, logger);
+    return;
+  }
+  startTcpProtocolListener(name, port, logger);
+}
+
+function startUdpProtocolService(
+  name: string,
+  port: number,
+  logger: Logger,
+  command?: string,
+) {
+  if (command?.trim()) {
+    startExternalCommand(name, command, logger);
+    return;
+  }
+  startUdpProtocolListener(name, port, logger);
+}
+
+function startExternalCommand(
+  name: string,
+  command: string,
+  logger: Logger,
+) {
+  const parts = parseCommand(command);
+  if (parts.length === 0) {
+    logger.warn(`${name} command is empty, falling back to dummy listener`);
+    return;
+  }
+  const [cmd, ...args] = parts;
+  logger.info(`${name} daemon starting: ${command}`);
+  try {
+    const process = new Deno.Command(cmd, {
+      args,
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    pipeProcessOutput(process, name, logger);
+  } catch (error) {
+    logger.error(`${name} daemon failed to start`, error);
+  }
+}
+
+function pipeProcessOutput(
+  process: Deno.ChildProcess,
+  name: string,
+  logger: Logger,
+) {
+  const decoder = new TextDecoder();
+  const logStream = async (
+    stream: ReadableStream<Uint8Array> | null,
+    level: "info" | "error",
+  ) => {
+    if (!stream) return;
+    try {
+      for await (const chunk of stream) {
+        const text = decoder.decode(chunk).trim();
+        if (text) {
+          logger[level](`[${name}] ${text}`);
+        }
+      }
+    } catch (error) {
+      logger.warn(`${name} daemon log stream failed`, error);
+    }
+  };
+  logStream(process.stdout, "info");
+  logStream(process.stderr, "error");
+  process.status.then((status) => {
+    if (status.success) {
+      logger.info(`${name} daemon exited`);
+    } else {
+      logger.warn(`${name} daemon exited with code ${status.code}`);
+    }
+  }).catch((error) => {
+    logger.error(`${name} daemon status error`, error);
+  });
+}
+
+function parseCommand(command: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let escapeNext = false;
+
+  for (const char of command) {
+    if (escapeNext) {
+      current += char;
+      escapeNext = false;
+      continue;
+    }
+    if (char === "\\") {
+      escapeNext = true;
+      continue;
+    }
+    if (char === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      continue;
+    }
+    if (char === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      continue;
+    }
+    if (!inSingleQuote && !inDoubleQuote && /\s/.test(char)) {
+      if (current) {
+        parts.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (current) {
+    parts.push(current);
+  }
+  return parts;
 }
 
 function startTcpProtocolListener(
