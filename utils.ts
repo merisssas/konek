@@ -1,6 +1,6 @@
 import type { LogLevel } from "./logger.ts";
 
-const VALID_LOG_LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
+const VALID_LOG_LEVELS: LogLevel[] = ["none", "debug", "info", "warn", "error"];
 
 export function readEnv(name: string): string | undefined {
   try {

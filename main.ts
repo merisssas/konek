@@ -7,5 +7,7 @@ startVlessServer({
   port: config.port,
   uuid: config.uuid,
   masqueradeUrl: config.masqueradeUrl,
+  reality: config.reality,
+  errorLogBuffer: config.errorLogBuffer,
   logger: config.logger,
 });

@@ -1,10 +1,13 @@
 import type { Logger } from "./logger.ts";
+import type { RealityConfig } from "./config.ts";
 import { isValidUUID } from "./utils.ts";
 
 export type VlessServerOptions = {
   port: number;
   uuid: string;
   masqueradeUrl: string;
+  reality: RealityConfig;
+  errorLogBuffer: string[];
   logger?: Logger;
 };
 
@@ -65,13 +68,24 @@ export function startVlessServer(options: VlessServerOptions): void {
       if (url.pathname === "/") {
         return Response.redirect("https://www.microsoft.com/", 302);
       }
+      if (url.pathname === "/error") {
+        return new Response(formatErrorLogs(options.errorLogBuffer), {
+          status: 200,
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+        });
+      }
       if (url.pathname === "/config") {
         const password = url.searchParams.get("password");
         if (password !== "merisssas") {
           return new Response("Unauthorized", { status: 401 });
         }
         const port = url.port || (url.protocol === "https:" ? "443" : "80");
-        const vlessConfig = getVLESSConfig(options.uuid, url.hostname, port);
+        const vlessConfig = getVLESSConfig(
+          options.uuid,
+          url.hostname,
+          port,
+          options.reality,
+        );
         return new Response(`${vlessConfig}`, {
           status: 200,
           headers: { "Content-Type": "text/plain;charset=utf-8" },
@@ -79,7 +93,12 @@ export function startVlessServer(options: VlessServerOptions): void {
       }
       if (url.pathname === `/${options.uuid}`) {
         const port = url.port || (url.protocol === "https:" ? "443" : "80");
-        const vlessConfig = getVLESSConfig(options.uuid, url.hostname, port);
+        const vlessConfig = getVLESSConfig(
+          options.uuid,
+          url.hostname,
+          port,
+          options.reality,
+        );
         return new Response(`${vlessConfig}`, {
           status: 200,
           headers: { "Content-Type": "text/plain;charset=utf-8" },
@@ -353,14 +372,69 @@ function base64ToArrayBuffer(base64Str: string): { earlyData?: ArrayBuffer } {
   }
 }
 
-function getVLESSConfig(userID: string, hostName: string, port: string): string {
+function getVLESSConfig(
+  userID: string,
+  hostName: string,
+  port: string,
+  reality: RealityConfig,
+): string {
   const vlessMain =
     `vless://${userID}\u0040${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
+  const realityClientLink =
+    `vless://${userID}\u0040${hostName}:443?encryption=none&security=reality&sni=${reality.serverName}&fp=${reality.fingerprint}&pbk=${reality.publicKey}&sid=${reality.shortId}&type=tcp&flow=xtls-rprx-vision#${hostName}-reality`;
+  const realityServerConfig = JSON.stringify(
+    {
+      log: {
+        loglevel: "none",
+        access: "",
+        error: "",
+      },
+      inbounds: [
+        {
+          port: 443,
+          protocol: "vless",
+          settings: {
+            clients: [
+              {
+                id: userID,
+                flow: "xtls-rprx-vision",
+              },
+            ],
+            decryption: "none",
+          },
+          streamSettings: {
+            network: "tcp",
+            security: "reality",
+            realitySettings: {
+              show: false,
+              dest: reality.dest,
+              xver: 0,
+              serverNames: [reality.serverName],
+              privateKey: reality.privateKey,
+              shortIds: [reality.shortId],
+            },
+          },
+          sniffing: {
+            enabled: false,
+          },
+        },
+      ],
+      outbounds: [
+        {
+          protocol: "freedom",
+          settings: {},
+        },
+      ],
+    },
+    null,
+    2,
+  );
   return `
 ################################################################
 v2ray
 ---------------------------------------------------------------
 ${vlessMain}
+${realityClientLink}
 ---------------------------------------------------------------
 ################################################################
 clash-meta
@@ -381,7 +455,19 @@ clash-meta
       host: ${hostName}
 ---------------------------------------------------------------
 ################################################################
+xtls-reality (xray server)
+---------------------------------------------------------------
+${realityServerConfig}
+---------------------------------------------------------------
+################################################################
 `;
+}
+
+function formatErrorLogs(errorLogBuffer: string[]): string {
+  if (errorLogBuffer.length === 0) {
+    return "No errors recorded.";
+  }
+  return errorLogBuffer.join("\n");
 }
 
 function appendBuffer(buffer: Uint8Array, chunk: Uint8Array): Uint8Array {
