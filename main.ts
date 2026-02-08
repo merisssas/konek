@@ -8,6 +8,10 @@ startVlessServer({
   uuid: config.uuid,
   masqueradeUrl: config.masqueradeUrl,
   reality: config.reality,
+  shadowsocks: config.shadowsocks,
+  trojan: config.trojan,
+  wireguard: config.wireguard,
+  zuivpn: config.zuivpn,
   errorLogBuffer: config.errorLogBuffer,
   logger: config.logger,
 });

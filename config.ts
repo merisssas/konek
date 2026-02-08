@@ -7,6 +7,10 @@ export type AppConfig = {
   logLevel: LogLevel;
   masqueradeUrl: string;
   reality: RealityConfig;
+  shadowsocks: ShadowsocksConfig;
+  trojan: TrojanConfig;
+  wireguard: WireguardConfig;
+  zuivpn: ZuiVpnConfig;
   errorLogBuffer: string[];
   logger: Logger;
 };
@@ -20,6 +24,32 @@ export type RealityConfig = {
   fingerprint: string;
 };
 
+export type ShadowsocksConfig = {
+  method: string;
+  password: string;
+  port: number;
+};
+
+export type TrojanConfig = {
+  password: string;
+  port: number;
+};
+
+export type WireguardConfig = {
+  privateKey: string;
+  publicKey: string;
+  presharedKey: string;
+  address: string;
+  dns: string;
+  port: number;
+};
+
+export type ZuiVpnConfig = {
+  username: string;
+  password: string;
+  port: number;
+};
+
 const DEFAULT_UUID = "841b9534-793e-4363-9976-59915e6659f4";
 const DEFAULT_PORT = 8080;
 const DEFAULT_LOG_LEVEL: LogLevel = "none";
@@ -30,6 +60,20 @@ const DEFAULT_REALITY_PRIVATE_KEY = "REPLACE_WITH_PRIVATE_KEY";
 const DEFAULT_REALITY_PUBLIC_KEY = "REPLACE_WITH_PUBLIC_KEY";
 const DEFAULT_REALITY_SHORT_ID = "a1b2c3d4";
 const DEFAULT_REALITY_FINGERPRINT = "chrome";
+const DEFAULT_SHADOWSOCKS_METHOD = "chacha20-ietf-poly1305";
+const DEFAULT_SHADOWSOCKS_PASSWORD = "REPLACE_WITH_SHADOWSOCKS_PASSWORD";
+const DEFAULT_SHADOWSOCKS_PORT = 8388;
+const DEFAULT_TROJAN_PASSWORD = "REPLACE_WITH_TROJAN_PASSWORD";
+const DEFAULT_TROJAN_PORT = 443;
+const DEFAULT_WIREGUARD_PRIVATE_KEY = "REPLACE_WITH_WG_PRIVATE_KEY";
+const DEFAULT_WIREGUARD_PUBLIC_KEY = "REPLACE_WITH_WG_PUBLIC_KEY";
+const DEFAULT_WIREGUARD_PRESHARED_KEY = "REPLACE_WITH_WG_PRESHARED_KEY";
+const DEFAULT_WIREGUARD_ADDRESS = "10.0.0.2/32";
+const DEFAULT_WIREGUARD_DNS = "https://ad.musicloud.io/dns-query";
+const DEFAULT_WIREGUARD_PORT = 51820;
+const DEFAULT_ZUIVPN_USERNAME = "REPLACE_WITH_ZUIVPN_USERNAME";
+const DEFAULT_ZUIVPN_PASSWORD = "REPLACE_WITH_ZUIVPN_PASSWORD";
+const DEFAULT_ZUIVPN_PORT = 1194;
 
 type RealityKeyPair = {
   privateKey: string;
@@ -105,6 +149,32 @@ export async function loadConfig(): Promise<AppConfig> {
     fingerprint: readEnv("REALITY_FINGERPRINT") ?? DEFAULT_REALITY_FINGERPRINT,
   };
 
+  const shadowsocks: ShadowsocksConfig = {
+    method: readEnv("SHADOWSOCKS_METHOD") ?? DEFAULT_SHADOWSOCKS_METHOD,
+    password: readEnv("SHADOWSOCKS_PASSWORD") ?? DEFAULT_SHADOWSOCKS_PASSWORD,
+    port: parsePort(readEnv("SHADOWSOCKS_PORT"), DEFAULT_SHADOWSOCKS_PORT),
+  };
+
+  const trojan: TrojanConfig = {
+    password: readEnv("TROJAN_PASSWORD") ?? DEFAULT_TROJAN_PASSWORD,
+    port: parsePort(readEnv("TROJAN_PORT"), DEFAULT_TROJAN_PORT),
+  };
+
+  const wireguard: WireguardConfig = {
+    privateKey: readEnv("WIREGUARD_PRIVATE_KEY") ?? DEFAULT_WIREGUARD_PRIVATE_KEY,
+    publicKey: readEnv("WIREGUARD_PUBLIC_KEY") ?? DEFAULT_WIREGUARD_PUBLIC_KEY,
+    presharedKey: readEnv("WIREGUARD_PRESHARED_KEY") ?? DEFAULT_WIREGUARD_PRESHARED_KEY,
+    address: readEnv("WIREGUARD_ADDRESS") ?? DEFAULT_WIREGUARD_ADDRESS,
+    dns: readEnv("WIREGUARD_DNS") ?? DEFAULT_WIREGUARD_DNS,
+    port: parsePort(readEnv("WIREGUARD_PORT"), DEFAULT_WIREGUARD_PORT),
+  };
+
+  const zuivpn: ZuiVpnConfig = {
+    username: readEnv("ZUIVPN_USERNAME") ?? DEFAULT_ZUIVPN_USERNAME,
+    password: readEnv("ZUIVPN_PASSWORD") ?? DEFAULT_ZUIVPN_PASSWORD,
+    port: parsePort(readEnv("ZUIVPN_PORT"), DEFAULT_ZUIVPN_PORT),
+  };
+
   if (!isValidUUID(uuid)) {
     throw new Error(`UUID is not valid: ${uuid}`);
   }
@@ -118,5 +188,17 @@ export async function loadConfig(): Promise<AppConfig> {
     throw new Error(`MASQUERADE_URL is not a valid URL: ${masqueradeUrl}`);
   }
 
-  return { uuid, port, logLevel, masqueradeUrl, reality, errorLogBuffer, logger };
+  return {
+    uuid,
+    port,
+    logLevel,
+    masqueradeUrl,
+    reality,
+    shadowsocks,
+    trojan,
+    wireguard,
+    zuivpn,
+    errorLogBuffer,
+    logger,
+  };
 }

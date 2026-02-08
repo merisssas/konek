@@ -1,5 +1,11 @@
 import type { Logger } from "./logger.ts";
-import type { RealityConfig } from "./config.ts";
+import type {
+  RealityConfig,
+  ShadowsocksConfig,
+  TrojanConfig,
+  WireguardConfig,
+  ZuiVpnConfig,
+} from "./config.ts";
 import { isValidUUID } from "./utils.ts";
 
 export type VlessServerOptions = {
@@ -7,6 +13,10 @@ export type VlessServerOptions = {
   uuid: string;
   masqueradeUrl: string;
   reality: RealityConfig;
+  shadowsocks: ShadowsocksConfig;
+  trojan: TrojanConfig;
+  wireguard: WireguardConfig;
+  zuivpn: ZuiVpnConfig;
   errorLogBuffer: string[];
   logger?: Logger;
 };
@@ -56,6 +66,10 @@ export function startVlessServer(options: VlessServerOptions): void {
   const logger = options.logger ?? console;
   const validUUIDBytes = uuidToBytes(options.uuid);
   logger.info(`VLESS server listening on :${options.port}`);
+  startTcpProtocolListener("shadowsocks", options.shadowsocks.port, logger);
+  startTcpProtocolListener("trojan", options.trojan.port, logger);
+  startTcpProtocolListener("zuivpn", options.zuivpn.port, logger);
+  startUdpProtocolListener("wireguard", options.wireguard.port, logger);
 
   Deno.serve({ port: options.port }, async (req) => {
     if (isMemoryPressure(MEMORY_USAGE_LIMIT)) {
@@ -85,6 +99,10 @@ export function startVlessServer(options: VlessServerOptions): void {
           url.hostname,
           port,
           options.reality,
+          options.shadowsocks,
+          options.trojan,
+          options.wireguard,
+          options.zuivpn,
         );
         return new Response(`${vlessConfig}`, {
           status: 200,
@@ -98,6 +116,10 @@ export function startVlessServer(options: VlessServerOptions): void {
           url.hostname,
           port,
           options.reality,
+          options.shadowsocks,
+          options.trojan,
+          options.wireguard,
+          options.zuivpn,
         );
         return new Response(`${vlessConfig}`, {
           status: 200,
@@ -377,11 +399,22 @@ function getVLESSConfig(
   hostName: string,
   port: string,
   reality: RealityConfig,
+  shadowsocks: ShadowsocksConfig,
+  trojan: TrojanConfig,
+  wireguard: WireguardConfig,
+  zuivpn: ZuiVpnConfig,
 ): string {
   const vlessMain =
     `vless://${userID}\u0040${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
   const realityClientLink =
     `vless://${userID}\u0040${hostName}:443?encryption=none&security=reality&sni=${reality.serverName}&fp=${reality.fingerprint}&pbk=${reality.publicKey}&sid=${reality.shortId}&type=tcp&flow=xtls-rprx-vision#${hostName}-reality`;
+  const shadowsocksUserInfo = base64Encode(
+    `${shadowsocks.method}:${shadowsocks.password}`,
+  );
+  const shadowsocksLink =
+    `ss://${shadowsocksUserInfo}\u0040${hostName}:${shadowsocks.port}#${hostName}-ss`;
+  const trojanLink =
+    `trojan://${trojan.password}\u0040${hostName}:${trojan.port}?sni=${hostName}&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}-trojan`;
   const realityServerConfig = JSON.stringify(
     {
       log: {
@@ -435,6 +468,8 @@ v2ray
 ---------------------------------------------------------------
 ${vlessMain}
 ${realityClientLink}
+${shadowsocksLink}
+${trojanLink}
 ---------------------------------------------------------------
 ################################################################
 clash-meta
@@ -454,13 +489,96 @@ clash-meta
     headers:
       host: ${hostName}
 ---------------------------------------------------------------
+- type: ss
+  name: ${hostName}-ss
+  server: ${hostName}
+  port: ${shadowsocks.port}
+  cipher: ${shadowsocks.method}
+  password: ${shadowsocks.password}
+  udp: true
+---------------------------------------------------------------
+- type: trojan
+  name: ${hostName}-trojan
+  server: ${hostName}
+  port: ${trojan.port}
+  password: ${trojan.password}
+  udp: true
+  sni: ${hostName}
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      host: ${hostName}
+---------------------------------------------------------------
 ################################################################
 xtls-reality (xray server)
 ---------------------------------------------------------------
 ${realityServerConfig}
 ---------------------------------------------------------------
 ################################################################
+wireguard
+---------------------------------------------------------------
+[Interface]
+PrivateKey = ${wireguard.privateKey}
+Address = ${wireguard.address}
+DNS = ${wireguard.dns}
+
+[Peer]
+PublicKey = ${wireguard.publicKey}
+PresharedKey = ${wireguard.presharedKey}
+Endpoint = ${hostName}:${wireguard.port}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+---------------------------------------------------------------
+################################################################
+zuivpn
+---------------------------------------------------------------
+username: ${zuivpn.username}
+password: ${zuivpn.password}
+server: ${hostName}
+port: ${zuivpn.port}
+---------------------------------------------------------------
+################################################################
 `;
+}
+
+function base64Encode(value: string): string {
+  return btoa(value);
+}
+
+function startTcpProtocolListener(
+  name: string,
+  port: number,
+  logger: Logger,
+) {
+  const listener = Deno.listen({ port });
+  logger.info(`${name} listener running on :${port}`);
+  (async () => {
+    for await (const conn of listener) {
+      conn.close();
+    }
+  })().catch((error) => {
+    logger.error(`${name} listener failed`, error);
+  });
+}
+
+function startUdpProtocolListener(
+  name: string,
+  port: number,
+  logger: Logger,
+) {
+  const socket = Deno.listenDatagram({
+    port,
+    transport: "udp",
+  });
+  logger.info(`${name} UDP listener running on :${port}`);
+  (async () => {
+    for await (const _packet of socket) {
+      // Intentionally ignore packets to keep port open.
+    }
+  })().catch((error) => {
+    logger.error(`${name} UDP listener failed`, error);
+  });
 }
 
 function formatErrorLogs(errorLogBuffer: string[]): string {
@@ -564,8 +682,8 @@ function parseVlessHeader(
     return { status: "invalid" };
   }
 
-  if (isLoopbackAddress(address)) {
-    logger.warn(`Blocked loopback address: ${address}`);
+  if (isBlockedAddress(address)) {
+    logger.warn(`Blocked private/loopback address: ${address}`);
     return { status: "invalid" };
   }
 
@@ -578,7 +696,7 @@ function parseVlessHeader(
   };
 }
 
-function isLoopbackAddress(address: string): boolean {
+function isBlockedAddress(address: string): boolean {
   if (address === "localhost") {
     return true;
   }
@@ -588,7 +706,40 @@ function isLoopbackAddress(address: string): boolean {
   if (address.startsWith("127.")) {
     return true;
   }
+  if (isPrivateIpv4(address)) {
+    return true;
+  }
+  if (isPrivateIpv6(address)) {
+    return true;
+  }
   return false;
+}
+
+function isPrivateIpv4(address: string): boolean {
+  const parts = address.split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  const octets = parts.map((part) => Number(part));
+  if (octets.some((octet) => Number.isNaN(octet) || octet < 0 || octet > 255)) {
+    return false;
+  }
+  const [a, b] = octets;
+  if (a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 198 && (b === 18 || b === 19)) return true;
+  if (a === 0) return true;
+  return false;
+}
+
+function isPrivateIpv6(address: string): boolean {
+  const normalized = address.toLowerCase();
+  return normalized.startsWith("fc") ||
+    normalized.startsWith("fd") ||
+    normalized.startsWith("fe80") ||
+    normalized === "::";
 }
 
 function createWebSocketReadableStream(
