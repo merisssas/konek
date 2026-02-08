@@ -161,7 +161,7 @@ async function handleVlessConnection(
 
         // Validasi UUID (Bytes 1-17)
         // Header structure: [Version(1)][UUID(16)][AddonsLen(1)]...
-        const clientUUID = chunk.slice(1, 17);
+        const clientUUID = chunk.subarray(1, 17);
         let isMatch = true;
         for (let i = 0; i < 16; i++) {
           if (clientUUID[i] !== validUUIDBytes[i]) {
@@ -198,12 +198,12 @@ async function handleVlessConnection(
         if (addrType === 1) {
           // IPv4 (4 bytes)
           addressEndIndex = addrTypeIndex + 1 + 4;
-          address = chunk.slice(addrTypeIndex + 1, addressEndIndex).join(".");
+          address = chunk.subarray(addrTypeIndex + 1, addressEndIndex).join(".");
         } else if (addrType === 2) {
           // Domain Name (Variable length: 1 byte len + string)
           const domainLen = chunk[addrTypeIndex + 1];
           addressEndIndex = addrTypeIndex + 1 + 1 + domainLen;
-          const domainBytes = chunk.slice(addrTypeIndex + 2, addressEndIndex);
+          const domainBytes = chunk.subarray(addrTypeIndex + 2, addressEndIndex);
           address = textDecoder.decode(domainBytes);
         } else if (addrType === 3) {
           // IPv6 (16 bytes) - simplified handling
@@ -226,6 +226,11 @@ async function handleVlessConnection(
         try {
           if (command === 1) { // TCP
             remoteConnection = await Deno.connect({ hostname: address, port: port });
+            try {
+              remoteConnection.setNoDelay(true);
+            } catch (_) {
+              // Ignore if not supported
+            }
           } else {
             // UDP belum didukung penuh secara stabil di mode ini tanpa muxing kompleks
             logger.error("UDP request not supported in this simple VLESS handler");
@@ -243,13 +248,23 @@ async function handleVlessConnection(
         // --- TAHAP 3: Kirim Respons VLESS ke Client ---
         // Response format: [Version(1)][AddonsLen(1)][Addons(0)]
         const vlessResponse = new Uint8Array([chunk[0], 0]);
-        ws.send(vlessResponse);
+        try {
+          ws.send(vlessResponse);
+        } catch (_) {
+          ws.close();
+          return;
+        }
 
         // --- TAHAP 4: Kirim Sisa Data (Payload) ke Remote ---
         // Data payload dimulai tepat setelah alamat
-        const payload = chunk.slice(addressEndIndex);
+        const payload = chunk.subarray(addressEndIndex);
         if (payload.length > 0) {
-          await remoteWriter.write(payload);
+          try {
+            await remoteWriter.write(payload);
+          } catch (_) {
+            ws.close();
+            return;
+          }
         }
 
         vlessHeaderProcessed = true;
@@ -262,7 +277,12 @@ async function handleVlessConnection(
         // --- TAHAP 6: Data Lanjutan (Setelah Handshake) ---
         // Langsung kirim raw data ke remote socket
         if (remoteWriter) {
-          await remoteWriter.write(chunk);
+          try {
+            await remoteWriter.write(chunk);
+          } catch (_) {
+            ws.close();
+            return;
+          }
         }
       }
     }
@@ -298,18 +318,25 @@ async function tarpitAndClose(ws: WebSocket) {
  * Fungsi untuk memompa data dari Remote TCP kembali ke WebSocket Client
  */
 async function pipeRemoteToWs(remoteConn: Deno.TcpConn, ws: WebSocket) {
-  const reader = remoteConn.readable.getReader();
+  const buffer = new Uint8Array(64 * 1024);
   try {
     while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(value);
-      } else {
+      let bytesRead: number | null;
+      try {
+        bytesRead = await remoteConn.read(buffer);
+      } catch (_) {
+        break;
+      }
+      if (bytesRead === null) break;
+      if (bytesRead === 0) continue;
+      if (ws.readyState !== WebSocket.OPEN) break;
+      try {
+        ws.send(buffer.subarray(0, bytesRead));
+      } catch (_) {
         break;
       }
     }
-  } catch (err) {
+  } catch (_) {
     // console.error("Remote read error:", err);
   } finally {
     try { ws.close(); } catch (_) {}
