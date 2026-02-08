@@ -50,6 +50,14 @@ function base64Encode(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function base64UrlEncode(bytes: Uint8Array): string {
+  return base64Encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function normalizeRealityPublicKey(value: string): string {
+  return value.trim().replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 async function generateRealityKeyPair(): Promise<RealityKeyPair> {
   const keyPair = await crypto.subtle.generateKey(
     { name: "X25519", namedCurve: "X25519" },
@@ -64,7 +72,7 @@ async function generateRealityKeyPair(): Promise<RealityKeyPair> {
   );
   const privateRaw = privatePkcs8.slice(-32);
   return {
-    publicKey: base64Encode(publicRaw),
+    publicKey: base64UrlEncode(publicRaw),
     privateKey: base64Encode(privateRaw),
   };
 }
@@ -84,7 +92,10 @@ export async function loadConfig(): Promise<AppConfig> {
   ) || isPlaceholder(realityPublicKey, DEFAULT_REALITY_PUBLIC_KEY);
   const realityKeyPair = shouldGenerateRealityKeys
     ? await generateRealityKeyPair()
-    : { privateKey: realityPrivateKey, publicKey: realityPublicKey };
+    : {
+      privateKey: realityPrivateKey,
+      publicKey: normalizeRealityPublicKey(realityPublicKey),
+    };
   const reality: RealityConfig = {
     serverName: readEnv("REALITY_SERVER_NAME") ?? DEFAULT_REALITY_SERVER_NAME,
     dest: readEnv("REALITY_DEST") ?? DEFAULT_REALITY_DEST,
