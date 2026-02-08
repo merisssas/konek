@@ -80,8 +80,19 @@ type RealityKeyPair = {
   publicKey: string;
 };
 
+type KeyPair = {
+  privateKey: string;
+  publicKey: string;
+};
+
 function isPlaceholder(value: string, placeholder: string): boolean {
   return value.trim() === "" || value === placeholder;
+}
+
+function randomBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return bytes;
 }
 
 function base64Encode(bytes: Uint8Array): string {
@@ -102,6 +113,10 @@ function normalizeRealityPublicKey(value: string): string {
   return value.trim().replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+function generateToken(length: number): string {
+  return base64UrlEncode(randomBytes(length));
+}
+
 async function generateRealityKeyPair(): Promise<RealityKeyPair> {
   const keyPair = await crypto.subtle.generateKey(
     { name: "X25519", namedCurve: "X25519" },
@@ -117,6 +132,25 @@ async function generateRealityKeyPair(): Promise<RealityKeyPair> {
   const privateRaw = privatePkcs8.slice(-32);
   return {
     publicKey: base64UrlEncode(publicRaw),
+    privateKey: base64Encode(privateRaw),
+  };
+}
+
+async function generateX25519KeyPair(): Promise<KeyPair> {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: "X25519", namedCurve: "X25519" },
+    true,
+    ["deriveBits"],
+  );
+  const publicRaw = new Uint8Array(
+    await crypto.subtle.exportKey("raw", keyPair.publicKey),
+  );
+  const privatePkcs8 = new Uint8Array(
+    await crypto.subtle.exportKey("pkcs8", keyPair.privateKey),
+  );
+  const privateRaw = privatePkcs8.slice(-32);
+  return {
+    publicKey: base64Encode(publicRaw),
     privateKey: base64Encode(privateRaw),
   };
 }
@@ -149,29 +183,82 @@ export async function loadConfig(): Promise<AppConfig> {
     fingerprint: readEnv("REALITY_FINGERPRINT") ?? DEFAULT_REALITY_FINGERPRINT,
   };
 
+  const rawShadowsocksPassword = readEnv("SHADOWSOCKS_PASSWORD") ??
+    DEFAULT_SHADOWSOCKS_PASSWORD;
+  const shadowsocksPassword = isPlaceholder(
+    rawShadowsocksPassword,
+    DEFAULT_SHADOWSOCKS_PASSWORD,
+  )
+    ? generateToken(32)
+    : rawShadowsocksPassword;
   const shadowsocks: ShadowsocksConfig = {
     method: readEnv("SHADOWSOCKS_METHOD") ?? DEFAULT_SHADOWSOCKS_METHOD,
-    password: readEnv("SHADOWSOCKS_PASSWORD") ?? DEFAULT_SHADOWSOCKS_PASSWORD,
+    password: shadowsocksPassword,
     port: parsePort(readEnv("SHADOWSOCKS_PORT"), DEFAULT_SHADOWSOCKS_PORT),
   };
 
+  const rawTrojanPassword = readEnv("TROJAN_PASSWORD") ?? DEFAULT_TROJAN_PASSWORD;
+  const trojanPassword = isPlaceholder(
+    rawTrojanPassword,
+    DEFAULT_TROJAN_PASSWORD,
+  )
+    ? generateToken(32)
+    : rawTrojanPassword;
   const trojan: TrojanConfig = {
-    password: readEnv("TROJAN_PASSWORD") ?? DEFAULT_TROJAN_PASSWORD,
+    password: trojanPassword,
     port: parsePort(readEnv("TROJAN_PORT"), DEFAULT_TROJAN_PORT),
   };
 
+  const rawWireguardPrivateKey = readEnv("WIREGUARD_PRIVATE_KEY") ??
+    DEFAULT_WIREGUARD_PRIVATE_KEY;
+  const rawWireguardPublicKey = readEnv("WIREGUARD_PUBLIC_KEY") ??
+    DEFAULT_WIREGUARD_PUBLIC_KEY;
+  const shouldGenerateWireguardKeys = isPlaceholder(
+    rawWireguardPrivateKey,
+    DEFAULT_WIREGUARD_PRIVATE_KEY,
+  ) || isPlaceholder(rawWireguardPublicKey, DEFAULT_WIREGUARD_PUBLIC_KEY);
+  const wireguardKeyPair = shouldGenerateWireguardKeys
+    ? await generateX25519KeyPair()
+    : {
+      privateKey: rawWireguardPrivateKey,
+      publicKey: rawWireguardPublicKey,
+    };
+  const rawWireguardPresharedKey = readEnv("WIREGUARD_PRESHARED_KEY") ??
+    DEFAULT_WIREGUARD_PRESHARED_KEY;
+  const wireguardPresharedKey = isPlaceholder(
+    rawWireguardPresharedKey,
+    DEFAULT_WIREGUARD_PRESHARED_KEY,
+  )
+    ? base64Encode(randomBytes(32))
+    : rawWireguardPresharedKey;
   const wireguard: WireguardConfig = {
-    privateKey: readEnv("WIREGUARD_PRIVATE_KEY") ?? DEFAULT_WIREGUARD_PRIVATE_KEY,
-    publicKey: readEnv("WIREGUARD_PUBLIC_KEY") ?? DEFAULT_WIREGUARD_PUBLIC_KEY,
-    presharedKey: readEnv("WIREGUARD_PRESHARED_KEY") ?? DEFAULT_WIREGUARD_PRESHARED_KEY,
+    privateKey: wireguardKeyPair.privateKey,
+    publicKey: wireguardKeyPair.publicKey,
+    presharedKey: wireguardPresharedKey,
     address: readEnv("WIREGUARD_ADDRESS") ?? DEFAULT_WIREGUARD_ADDRESS,
     dns: readEnv("WIREGUARD_DNS") ?? DEFAULT_WIREGUARD_DNS,
     port: parsePort(readEnv("WIREGUARD_PORT"), DEFAULT_WIREGUARD_PORT),
   };
 
+  const rawZuivpnUsername = readEnv("ZUIVPN_USERNAME") ??
+    DEFAULT_ZUIVPN_USERNAME;
+  const rawZuivpnPassword = readEnv("ZUIVPN_PASSWORD") ??
+    DEFAULT_ZUIVPN_PASSWORD;
+  const zuivpnUsername = isPlaceholder(
+    rawZuivpnUsername,
+    DEFAULT_ZUIVPN_USERNAME,
+  )
+    ? `zuivpn-${generateToken(6)}`
+    : rawZuivpnUsername;
+  const zuivpnPassword = isPlaceholder(
+    rawZuivpnPassword,
+    DEFAULT_ZUIVPN_PASSWORD,
+  )
+    ? generateToken(12)
+    : rawZuivpnPassword;
   const zuivpn: ZuiVpnConfig = {
-    username: readEnv("ZUIVPN_USERNAME") ?? DEFAULT_ZUIVPN_USERNAME,
-    password: readEnv("ZUIVPN_PASSWORD") ?? DEFAULT_ZUIVPN_PASSWORD,
+    username: zuivpnUsername,
+    password: zuivpnPassword,
     port: parsePort(readEnv("ZUIVPN_PORT"), DEFAULT_ZUIVPN_PORT),
   };
 
