@@ -497,6 +497,7 @@ function createWebSocketReadableStream(
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
   let pullResolve: (() => void) | null = null;
 
+  let streamClosed = false;
   const pump = () => {
     if (!controllerRef) {
       return;
@@ -516,11 +517,12 @@ function createWebSocketReadableStream(
   };
 
   const enqueueChunk = (chunk: Uint8Array) => {
-    if (!controllerRef) {
+    if (!controllerRef || streamClosed) {
       return;
     }
     if (queuedBytes + chunk.length > MAX_WS_QUEUE_BYTES) {
       logger.warn("WebSocket receive queue overflow, closing connection.");
+      streamClosed = true;
       controllerRef.error(new Error("WebSocket receive queue overflow"));
       try { ws.close(); } catch (_) {}
       return;
@@ -538,12 +540,29 @@ function createWebSocketReadableStream(
     start(controller) {
       controllerRef = controller;
       ws.onmessage = (event) => {
+        if (streamClosed) {
+          return;
+        }
         if (event.data instanceof ArrayBuffer) {
           enqueueChunk(new Uint8Array(event.data));
         }
       };
-      ws.onclose = () => controller.close();
-      ws.onerror = (e) => controller.error(e);
+      ws.onclose = () => {
+        if (streamClosed) {
+          return;
+        }
+        streamClosed = true;
+        try {
+          controller.close();
+        } catch (_) {}
+      };
+      ws.onerror = (e) => {
+        if (streamClosed) {
+          return;
+        }
+        streamClosed = true;
+        controller.error(e);
+      };
 
       if (earlyData) {
         enqueueChunk(new Uint8Array(earlyData));
@@ -558,6 +577,9 @@ function createWebSocketReadableStream(
       }
     },
     cancel() {
+      if (!streamClosed) {
+        streamClosed = true;
+      }
       ws.close();
     },
   });
