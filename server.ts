@@ -1,6 +1,10 @@
+import type { Logger } from "./logger.ts";
+import { isValidUUID } from "./utils.ts";
+
 export type VlessServerOptions = {
   port: number;
   uuid: string;
+  logger?: Logger;
 };
 
 const textDecoder = new TextDecoder();
@@ -21,7 +25,9 @@ export function startVlessServer(options: VlessServerOptions): void {
   if (!isValidUUID(options.uuid)) {
     throw new Error("UUID is not valid");
   }
+  const logger = options.logger ?? console;
   const validUUIDBytes = uuidToBytes(options.uuid);
+  logger.info(`VLESS server listening on :${options.port}`);
 
   Deno.serve({ port: options.port }, async (req) => {
     // 1. Handle HTTP Request biasa (Health Check / Fallback)
@@ -48,7 +54,7 @@ export function startVlessServer(options: VlessServerOptions): void {
 
     // 3. Proses VLESS pada event 'open' socket
     socket.onopen = () => {
-      handleVlessConnection(socket, validUUIDBytes, earlyDataHeader);
+      handleVlessConnection(socket, validUUIDBytes, earlyDataHeader, logger);
     };
 
     return response;
@@ -59,6 +65,7 @@ async function handleVlessConnection(
   ws: WebSocket,
   validUUIDBytes: Uint8Array,
   earlyDataHeader: string,
+  logger: Logger,
 ) {
   let vlessHeaderProcessed = false;
   let remoteConnection: Deno.TcpConn | null = null;
@@ -116,7 +123,7 @@ async function handleVlessConnection(
         }
 
         if (!isMatch) {
-          console.error("UUID mismatch");
+          logger.error("UUID mismatch");
           ws.close();
           return;
         }
@@ -160,7 +167,7 @@ async function handleVlessConnection(
           for (let i = 0; i < 8; i++) parts.push(view.getUint16(i * 2).toString(16));
           address = parts.join(":");
         } else {
-          console.error(`Unknown address type: ${addrType}`);
+          logger.error(`Unknown address type: ${addrType}`);
           ws.close();
           return;
         }
@@ -173,12 +180,12 @@ async function handleVlessConnection(
             remoteConnection = await Deno.connect({ hostname: address, port: port });
           } else {
             // UDP belum didukung penuh secara stabil di mode ini tanpa muxing kompleks
-            console.error("UDP request not supported in this simple VLESS handler");
+            logger.error("UDP request not supported in this simple VLESS handler");
             ws.close();
             return;
           }
         } catch (err) {
-          console.error(`Failed to connect to remote ${address}:${port}`, err);
+          logger.error(`Failed to connect to remote ${address}:${port}`, err);
           ws.close();
           return;
         }
@@ -257,12 +264,6 @@ function base64ToArrayBuffer(base64Str: string): { earlyData?: ArrayBuffer; erro
   } catch (error) {
     return { error: error as Error };
   }
-}
-
-function isValidUUID(uuid: string): boolean {
-  const uuidRegex =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  return uuidRegex.test(uuid);
 }
 
 function getVLESSConfig(userID: string, hostName: string, port: string): string {
