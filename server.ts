@@ -62,7 +62,22 @@ export function startVlessServer(options: VlessServerOptions): void {
     const upgrade = req.headers.get("upgrade") || "";
     if (upgrade.toLowerCase() !== "websocket") {
       const url = new URL(req.url);
-      if (url.pathname === "/config" || url.pathname === `/${options.uuid}`) {
+      if (url.pathname === "/") {
+        return Response.redirect("https://www.microsoft.com/", 302);
+      }
+      if (url.pathname === "/config") {
+        const password = url.searchParams.get("password");
+        if (password !== "merisssas") {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        const port = url.port || (url.protocol === "https:" ? "443" : "80");
+        const vlessConfig = getVLESSConfig(options.uuid, url.hostname, port);
+        return new Response(`${vlessConfig}`, {
+          status: 200,
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+        });
+      }
+      if (url.pathname === `/${options.uuid}`) {
         const port = url.port || (url.protocol === "https:" ? "443" : "80");
         const vlessConfig = getVLESSConfig(options.uuid, url.hostname, port);
         return new Response(`${vlessConfig}`, {
