@@ -11,6 +11,26 @@ export type VlessServerOptions = {
 const textDecoder = new TextDecoder();
 const MEMORY_USAGE_LIMIT = 0.9;
 const TARPIT_DELAY_MS = 2000;
+const MAX_WS_QUEUE_BYTES = 4 * 1024 * 1024;
+
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "upgrade",
+  "proxy-connection",
+  "keep-alive",
+  "transfer-encoding",
+  "te",
+  "trailer",
+  "proxy-authenticate",
+  "proxy-authorization",
+]);
+
+const FORWARDED_HEADER_PREFIXES = [
+  "x-forwarded-",
+  "cf-",
+  "true-client-",
+  "forwarded",
+];
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -54,12 +74,17 @@ export function startVlessServer(options: VlessServerOptions): void {
     }
 
     // 2. Upgrade ke WebSocket
-    const { socket, response } = Deno.upgradeWebSocket(req);
-    const earlyDataHeader = req.headers.get("sec-websocket-protocol") || "";
+    const { earlyData, protocol } = parseWebSocketProtocolHeader(
+      req.headers.get("sec-websocket-protocol") || "",
+    );
+    const { socket, response } = Deno.upgradeWebSocket(
+      req,
+      protocol ? { protocol } : undefined,
+    );
 
     // 3. Proses VLESS pada event 'open' socket
     socket.onopen = () => {
-      handleVlessConnection(socket, validUUIDBytes, earlyDataHeader, logger);
+      handleVlessConnection(socket, validUUIDBytes, earlyData, logger);
     };
 
     return response;
@@ -86,7 +111,7 @@ async function proxyMasquerade(
   targetUrl.pathname = incomingUrl.pathname;
   targetUrl.search = incomingUrl.search;
 
-  const headers = new Headers(req.headers);
+  const headers = filterRequestHeaders(req.headers);
   headers.set("host", targetUrl.host);
 
   const outboundRequest = new Request(targetUrl.toString(), {
@@ -101,7 +126,7 @@ async function proxyMasquerade(
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
-      headers: response.headers,
+      headers: filterResponseHeaders(response.headers),
     });
   } catch (error) {
     logger.error("Masquerade proxy failed", error);
@@ -112,35 +137,16 @@ async function proxyMasquerade(
 async function handleVlessConnection(
   ws: WebSocket,
   validUUIDBytes: Uint8Array,
-  earlyDataHeader: string,
+  earlyData: ArrayBuffer | undefined,
   logger: Logger,
 ) {
   let vlessHeaderProcessed = false;
   let remoteConnection: Deno.TcpConn | null = null;
   let remoteWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  let handshakeBuffer = new Uint8Array(0);
 
   // Stream untuk membaca data dari WebSocket
-  const stream = new ReadableStream({
-    start(controller) {
-      ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          controller.enqueue(new Uint8Array(event.data));
-        }
-      };
-      ws.onclose = () => controller.close();
-      ws.onerror = (e) => controller.error(e);
-
-      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-      if (error) {
-        controller.error(error);
-      } else if (earlyData) {
-        controller.enqueue(new Uint8Array(earlyData));
-      }
-    },
-    cancel() {
-      ws.close();
-    }
-  });
+  const stream = createWebSocketReadableStream(ws, earlyData, logger);
 
   const reader = stream.getReader();
 
@@ -153,70 +159,13 @@ async function handleVlessConnection(
 
       // --- TAHAP 1: Handshake & Parsing Header VLESS (Hanya sekali di awal) ---
       if (!vlessHeaderProcessed) {
-        if (chunk.length < 17) {
-          // Data terlalu pendek untuk validasi UUID
+        handshakeBuffer = appendBuffer(handshakeBuffer, chunk);
+        const parsed = parseVlessHeader(handshakeBuffer, validUUIDBytes, logger);
+        if (parsed.status === "need_more") {
+          continue;
+        }
+        if (parsed.status === "invalid") {
           await tarpitAndClose(ws);
-          return;
-        }
-
-        // Validasi UUID (Bytes 1-17)
-        // Header structure: [Version(1)][UUID(16)][AddonsLen(1)]...
-        const clientUUID = chunk.subarray(1, 17);
-        let isMatch = true;
-        for (let i = 0; i < 16; i++) {
-          if (clientUUID[i] !== validUUIDBytes[i]) {
-            isMatch = false;
-            break;
-          }
-        }
-
-        if (!isMatch) {
-          logger.error("UUID mismatch");
-          await tarpitAndClose(ws);
-          return;
-        }
-
-        // Parse Metadata VLESS
-        const addonsLen = chunk[17];
-        // Skip addons (biasanya 0) + command byte (1 byte)
-        // Index awal data perintah ada di 18 + addonsLen
-        const commandIndex = 18 + addonsLen;
-        const command = chunk[commandIndex]; // 0x01 = TCP, 0x02 = UDP
-
-        // Port (2 bytes, Big Endian) dimulai setelah command
-        const portIndex = commandIndex + 1;
-        const port = (chunk[portIndex] << 8) | chunk[portIndex + 1];
-
-        // Address Type (1 byte)
-        const addrTypeIndex = portIndex + 2;
-        const addrType = chunk[addrTypeIndex];
-
-        // Parse Alamat Tujuan
-        let address = "";
-        let addressEndIndex = 0;
-
-        if (addrType === 1) {
-          // IPv4 (4 bytes)
-          addressEndIndex = addrTypeIndex + 1 + 4;
-          address = chunk.subarray(addrTypeIndex + 1, addressEndIndex).join(".");
-        } else if (addrType === 2) {
-          // Domain Name (Variable length: 1 byte len + string)
-          const domainLen = chunk[addrTypeIndex + 1];
-          addressEndIndex = addrTypeIndex + 1 + 1 + domainLen;
-          const domainBytes = chunk.subarray(addrTypeIndex + 2, addressEndIndex);
-          address = textDecoder.decode(domainBytes);
-        } else if (addrType === 3) {
-          // IPv6 (16 bytes) - simplified handling
-          addressEndIndex = addrTypeIndex + 1 + 16;
-          // Parsing IPv6 di JS agak panjang, untuk efisiensi kita anggap valid atau gunakan library jika perlu strict
-          // Disini kita format sederhana untuk koneksi Deno
-          const view = new DataView(chunk.buffer, chunk.byteOffset + addrTypeIndex + 1, 16);
-          const parts = [];
-          for (let i = 0; i < 8; i++) parts.push(view.getUint16(i * 2).toString(16));
-          address = parts.join(":");
-        } else {
-          logger.error(`Unknown address type: ${addrType}`);
-          ws.close();
           return;
         }
 
@@ -224,8 +173,11 @@ async function handleVlessConnection(
 
         // --- TAHAP 2: Koneksi ke Tujuan (Remote) ---
         try {
-          if (command === 1) { // TCP
-            remoteConnection = await Deno.connect({ hostname: address, port: port });
+          if (parsed.command === 1) { // TCP
+            remoteConnection = await Deno.connect({
+              hostname: parsed.address,
+              port: parsed.port,
+            });
             try {
               remoteConnection.setNoDelay(true);
             } catch (_) {
@@ -238,7 +190,10 @@ async function handleVlessConnection(
             return;
           }
         } catch (err) {
-          logger.error(`Failed to connect to remote ${address}:${port}`, err);
+          logger.error(
+            `Failed to connect to remote ${parsed.address}:${parsed.port}`,
+            err,
+          );
           ws.close();
           return;
         }
@@ -247,7 +202,7 @@ async function handleVlessConnection(
 
         // --- TAHAP 3: Kirim Respons VLESS ke Client ---
         // Response format: [Version(1)][AddonsLen(1)][Addons(0)]
-        const vlessResponse = new Uint8Array([chunk[0], 0]);
+        const vlessResponse = new Uint8Array([handshakeBuffer[0], 0]);
         try {
           ws.send(vlessResponse);
         } catch (_) {
@@ -257,7 +212,7 @@ async function handleVlessConnection(
 
         // --- TAHAP 4: Kirim Sisa Data (Payload) ke Remote ---
         // Data payload dimulai tepat setelah alamat
-        const payload = chunk.subarray(addressEndIndex);
+        const payload = handshakeBuffer.subarray(parsed.payloadOffset);
         if (payload.length > 0) {
           try {
             await remoteWriter.write(payload);
@@ -268,10 +223,13 @@ async function handleVlessConnection(
         }
 
         vlessHeaderProcessed = true;
+        handshakeBuffer = new Uint8Array(0);
 
         // --- TAHAP 5: Setup Pipa Balik (Remote -> WebSocket) ---
         // Kita tidak await ini agar loop pembacaan WS tidak terblokir
-        pipeRemoteToWs(remoteConnection, ws).catch(() => {});
+        pipeRemoteToWs(remoteConnection, ws, logger).catch((error) => {
+          logger.warn("Remote to WebSocket pipe failed", error);
+        });
 
       } else {
         // --- TAHAP 6: Data Lanjutan (Setelah Handshake) ---
@@ -317,7 +275,11 @@ async function tarpitAndClose(ws: WebSocket) {
 /**
  * Fungsi untuk memompa data dari Remote TCP kembali ke WebSocket Client
  */
-async function pipeRemoteToWs(remoteConn: Deno.TcpConn, ws: WebSocket) {
+async function pipeRemoteToWs(
+  remoteConn: Deno.TcpConn,
+  ws: WebSocket,
+  logger: Logger,
+) {
   const buffer = new Uint8Array(64 * 1024);
   try {
     while (true) {
@@ -336,24 +298,43 @@ async function pipeRemoteToWs(remoteConn: Deno.TcpConn, ws: WebSocket) {
         break;
       }
     }
-  } catch (_) {
-    // console.error("Remote read error:", err);
+  } catch (error) {
+    logger.warn("Remote read error", error);
   } finally {
     try { ws.close(); } catch (_) {}
   }
 }
 
-function base64ToArrayBuffer(base64Str: string): { earlyData?: ArrayBuffer; error?: Error } {
+function parseWebSocketProtocolHeader(
+  headerValue: string,
+): { earlyData?: ArrayBuffer; protocol?: string } {
+  const tokens = headerValue
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  for (const token of tokens) {
+    const { earlyData } = base64ToArrayBuffer(token);
+    if (earlyData) {
+      return { earlyData, protocol: token };
+    }
+  }
+  if (tokens.length > 0) {
+    return { protocol: tokens[0] };
+  }
+  return {};
+}
+
+function base64ToArrayBuffer(base64Str: string): { earlyData?: ArrayBuffer } {
   if (!base64Str) {
-    return { error: undefined };
+    return {};
   }
   try {
     const normalized = base64Str.replace(/-/g, "+").replace(/_/g, "/");
     const decoded = atob(normalized);
     const bytes = Uint8Array.from(decoded, (char) => char.charCodeAt(0));
     return { earlyData: bytes.buffer };
-  } catch (error) {
-    return { error: error as Error };
+  } catch (_) {
+    return {};
   }
 }
 
@@ -386,4 +367,218 @@ clash-meta
 ---------------------------------------------------------------
 ################################################################
 `;
+}
+
+function appendBuffer(buffer: Uint8Array, chunk: Uint8Array): Uint8Array {
+  if (buffer.length === 0) {
+    return chunk;
+  }
+  const merged = new Uint8Array(buffer.length + chunk.length);
+  merged.set(buffer);
+  merged.set(chunk, buffer.length);
+  return merged;
+}
+
+function parseVlessHeader(
+  buffer: Uint8Array,
+  validUUIDBytes: Uint8Array,
+  logger: Logger,
+): {
+  status: "need_more" | "invalid" | "ok";
+  command?: number;
+  port?: number;
+  address?: string;
+  payloadOffset?: number;
+} {
+  if (buffer.length < 18) {
+    return { status: "need_more" };
+  }
+
+  const clientUUID = buffer.subarray(1, 17);
+  for (let i = 0; i < 16; i++) {
+    if (clientUUID[i] !== validUUIDBytes[i]) {
+      logger.error("UUID mismatch");
+      return { status: "invalid" };
+    }
+  }
+
+  const addonsLen = buffer[17];
+  const commandIndex = 18 + addonsLen;
+  if (buffer.length <= commandIndex) {
+    return { status: "need_more" };
+  }
+  const command = buffer[commandIndex];
+  if (command !== 1) {
+    logger.error("UDP request not supported in this simple VLESS handler");
+    return { status: "invalid" };
+  }
+
+  const portIndex = commandIndex + 1;
+  if (buffer.length <= portIndex + 1) {
+    return { status: "need_more" };
+  }
+  const port = (buffer[portIndex] << 8) | buffer[portIndex + 1];
+
+  const addrTypeIndex = portIndex + 2;
+  if (buffer.length <= addrTypeIndex) {
+    return { status: "need_more" };
+  }
+
+  const addrType = buffer[addrTypeIndex];
+  let address = "";
+  let addressEndIndex = 0;
+
+  if (addrType === 1) {
+    addressEndIndex = addrTypeIndex + 1 + 4;
+    if (buffer.length < addressEndIndex) {
+      return { status: "need_more" };
+    }
+    address = buffer.subarray(addrTypeIndex + 1, addressEndIndex).join(".");
+  } else if (addrType === 2) {
+    if (buffer.length <= addrTypeIndex + 1) {
+      return { status: "need_more" };
+    }
+    const domainLen = buffer[addrTypeIndex + 1];
+    addressEndIndex = addrTypeIndex + 2 + domainLen;
+    if (buffer.length < addressEndIndex) {
+      return { status: "need_more" };
+    }
+    const domainBytes = buffer.subarray(addrTypeIndex + 2, addressEndIndex);
+    address = textDecoder.decode(domainBytes);
+  } else if (addrType === 3) {
+    addressEndIndex = addrTypeIndex + 1 + 16;
+    if (buffer.length < addressEndIndex) {
+      return { status: "need_more" };
+    }
+    const view = new DataView(
+      buffer.buffer,
+      buffer.byteOffset + addrTypeIndex + 1,
+      16,
+    );
+    const parts = [];
+    for (let i = 0; i < 8; i++) parts.push(view.getUint16(i * 2).toString(16));
+    address = parts.join(":");
+  } else {
+    logger.error(`Unknown address type: ${addrType}`);
+    return { status: "invalid" };
+  }
+
+  return {
+    status: "ok",
+    command,
+    port,
+    address,
+    payloadOffset: addressEndIndex,
+  };
+}
+
+function createWebSocketReadableStream(
+  ws: WebSocket,
+  earlyData: ArrayBuffer | undefined,
+  logger: Logger,
+): ReadableStream<Uint8Array> {
+  const queue: Uint8Array[] = [];
+  let queuedBytes = 0;
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let pullResolve: (() => void) | null = null;
+
+  const pump = () => {
+    if (!controllerRef) {
+      return;
+    }
+    while (queue.length > 0) {
+      const desired = controllerRef.desiredSize;
+      if (desired !== null && desired <= 0) {
+        break;
+      }
+      const chunk = queue.shift();
+      if (!chunk) {
+        break;
+      }
+      queuedBytes -= chunk.length;
+      controllerRef.enqueue(chunk);
+    }
+  };
+
+  const enqueueChunk = (chunk: Uint8Array) => {
+    if (!controllerRef) {
+      return;
+    }
+    if (queuedBytes + chunk.length > MAX_WS_QUEUE_BYTES) {
+      logger.warn("WebSocket receive queue overflow, closing connection.");
+      controllerRef.error(new Error("WebSocket receive queue overflow"));
+      try { ws.close(); } catch (_) {}
+      return;
+    }
+    queue.push(chunk);
+    queuedBytes += chunk.length;
+    pump();
+    if (pullResolve && queue.length > 0) {
+      pullResolve();
+      pullResolve = null;
+    }
+  };
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef = controller;
+      ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          enqueueChunk(new Uint8Array(event.data));
+        }
+      };
+      ws.onclose = () => controller.close();
+      ws.onerror = (e) => controller.error(e);
+
+      if (earlyData) {
+        enqueueChunk(new Uint8Array(earlyData));
+      }
+    },
+    pull() {
+      pump();
+      if (queue.length === 0) {
+        return new Promise<void>((resolve) => {
+          pullResolve = resolve;
+        });
+      }
+    },
+    cancel() {
+      ws.close();
+    },
+  });
+}
+
+function filterRequestHeaders(headers: Headers): Headers {
+  const filtered = new Headers();
+  const connectionHeader = headers.get("connection");
+  const connectionTokens = connectionHeader
+    ? connectionHeader.split(",").map((value) => value.trim().toLowerCase())
+    : [];
+  for (const [key, value] of headers.entries()) {
+    const lowerKey = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lowerKey) || connectionTokens.includes(lowerKey)) {
+      continue;
+    }
+    if (FORWARDED_HEADER_PREFIXES.some((prefix) => lowerKey.startsWith(prefix))) {
+      continue;
+    }
+    filtered.set(key, value);
+  }
+  return filtered;
+}
+
+function filterResponseHeaders(headers: Headers): Headers {
+  const filtered = new Headers();
+  const connectionHeader = headers.get("connection");
+  const connectionTokens = connectionHeader
+    ? connectionHeader.split(",").map((value) => value.trim().toLowerCase())
+    : [];
+  for (const [key, value] of headers.entries()) {
+    const lowerKey = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lowerKey) || connectionTokens.includes(lowerKey)) {
+      continue;
+    }
+    filtered.set(key, value);
+  }
+  return filtered;
 }
