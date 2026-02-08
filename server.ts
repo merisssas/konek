@@ -424,7 +424,7 @@ function parseVlessHeader(
   }
   const command = buffer[commandIndex];
   if (command !== 1) {
-    logger.error("UDP request not supported in this simple VLESS handler");
+    logger.warn("UDP request not supported in this simple VLESS handler");
     return { status: "invalid" };
   }
 
@@ -478,6 +478,11 @@ function parseVlessHeader(
     return { status: "invalid" };
   }
 
+  if (isLoopbackAddress(address)) {
+    logger.warn(`Blocked loopback address: ${address}`);
+    return { status: "invalid" };
+  }
+
   return {
     status: "ok",
     command,
@@ -485,6 +490,19 @@ function parseVlessHeader(
     address,
     payloadOffset: addressEndIndex,
   };
+}
+
+function isLoopbackAddress(address: string): boolean {
+  if (address === "localhost") {
+    return true;
+  }
+  if (address === "::1") {
+    return true;
+  }
+  if (address.startsWith("127.")) {
+    return true;
+  }
+  return false;
 }
 
 function createWebSocketReadableStream(
