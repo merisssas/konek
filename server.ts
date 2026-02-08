@@ -551,7 +551,13 @@ function startTcpProtocolListener(
   port: number,
   logger: Logger,
 ) {
-  const listener = Deno.listen({ port });
+  let listener: Deno.Listener;
+  try {
+    listener = Deno.listen({ port });
+  } catch (error) {
+    logger.warn(`${name} listener failed to start on :${port}`, error);
+    return;
+  }
   logger.info(`${name} listener running on :${port}`);
   (async () => {
     for await (const conn of listener) {
@@ -567,10 +573,16 @@ function startUdpProtocolListener(
   port: number,
   logger: Logger,
 ) {
-  const socket = Deno.listenDatagram({
-    port,
-    transport: "udp",
-  });
+  let socket: Deno.DatagramConn;
+  try {
+    socket = Deno.listenDatagram({
+      port,
+      transport: "udp",
+    });
+  } catch (error) {
+    logger.warn(`${name} UDP listener failed to start on :${port}`, error);
+    return;
+  }
   logger.info(`${name} UDP listener running on :${port}`);
   (async () => {
     for await (const _packet of socket) {
