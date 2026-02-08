@@ -77,7 +77,7 @@ const DEFAULT_WIREGUARD_PRIVATE_KEY = "REPLACE_WITH_WG_PRIVATE_KEY";
 const DEFAULT_WIREGUARD_PUBLIC_KEY = "REPLACE_WITH_WG_PUBLIC_KEY";
 const DEFAULT_WIREGUARD_PRESHARED_KEY = "REPLACE_WITH_WG_PRESHARED_KEY";
 const DEFAULT_WIREGUARD_ADDRESS = "10.0.0.2/32";
-const DEFAULT_WIREGUARD_DNS = "https://ad.musicloud.io/dns-query";
+const DEFAULT_WIREGUARD_DNS = "8.8.8.8";
 const DEFAULT_WIREGUARD_PORT = 51820;
 const DEFAULT_ZUIVPN_USERNAME = "REPLACE_WITH_ZUIVPN_USERNAME";
 const DEFAULT_ZUIVPN_PASSWORD = "REPLACE_WITH_ZUIVPN_PASSWORD";
@@ -115,6 +115,22 @@ function base64Encode(bytes: Uint8Array): string {
 
 function base64UrlEncode(bytes: Uint8Array): string {
   return base64Encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function readServerDns(): Promise<string | null> {
+  try {
+    const content = await Deno.readTextFile("/etc/resolv.conf");
+    const lines = content.split(/\r?\n/);
+    for (const line of lines) {
+      const match = line.match(/^\s*nameserver\s+(\S+)/);
+      if (match?.[1]) {
+        return match[1];
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 function normalizeRealityPublicKey(value: string): string {
@@ -239,12 +255,13 @@ export async function loadConfig(): Promise<AppConfig> {
   )
     ? base64Encode(randomBytes(32))
     : rawWireguardPresharedKey;
+  const serverDns = await readServerDns();
   const wireguard: WireguardConfig = {
     privateKey: wireguardKeyPair.privateKey,
     publicKey: wireguardKeyPair.publicKey,
     presharedKey: wireguardPresharedKey,
     address: readEnv("WIREGUARD_ADDRESS") ?? DEFAULT_WIREGUARD_ADDRESS,
-    dns: readEnv("WIREGUARD_DNS") ?? DEFAULT_WIREGUARD_DNS,
+    dns: readEnv("WIREGUARD_DNS") ?? serverDns ?? DEFAULT_WIREGUARD_DNS,
     port: parsePort(readEnv("WIREGUARD_PORT"), DEFAULT_WIREGUARD_PORT),
   };
 
