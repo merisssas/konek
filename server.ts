@@ -4,10 +4,15 @@ import { isValidUUID } from "./utils.ts";
 export type VlessServerOptions = {
   port: number;
   uuid: string;
+  masqueradeUrl: string;
   logger?: Logger;
 };
 
 const textDecoder = new TextDecoder();
+const MEMORY_USAGE_LIMIT = 0.9;
+const TARPIT_DELAY_MS = 2000;
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Mengonversi string UUID menjadi Uint8Array untuk validasi binary
@@ -30,13 +35,13 @@ export function startVlessServer(options: VlessServerOptions): void {
   logger.info(`VLESS server listening on :${options.port}`);
 
   Deno.serve({ port: options.port }, async (req) => {
+    if (isMemoryPressure(MEMORY_USAGE_LIMIT)) {
+      return new Response("Service Unavailable", { status: 503 });
+    }
     // 1. Handle HTTP Request biasa (Health Check / Fallback)
     const upgrade = req.headers.get("upgrade") || "";
     if (upgrade.toLowerCase() !== "websocket") {
       const url = new URL(req.url);
-      if (url.pathname === "/") {
-        return new Response("Hello, world!");
-      }
       if (url.pathname === `/${options.uuid}`) {
         const port = url.port || (url.protocol === "https:" ? "443" : "80");
         const vlessConfig = getVLESSConfig(options.uuid, url.hostname, port);
@@ -45,7 +50,7 @@ export function startVlessServer(options: VlessServerOptions): void {
           headers: { "Content-Type": "text/plain;charset=utf-8" },
         });
       }
-      return new Response("Not found", { status: 404 });
+      return await proxyMasquerade(req, options.masqueradeUrl, logger);
     }
 
     // 2. Upgrade ke WebSocket
@@ -59,6 +64,49 @@ export function startVlessServer(options: VlessServerOptions): void {
 
     return response;
   });
+}
+
+function isMemoryPressure(limit: number): boolean {
+  const info = Deno.systemMemoryInfo();
+  if (info.total <= 0) {
+    return false;
+  }
+  const available = info.available > 0 ? info.available : info.free;
+  const usageRatio = (info.total - available) / info.total;
+  return usageRatio >= limit;
+}
+
+async function proxyMasquerade(
+  req: Request,
+  masqueradeUrl: string,
+  logger: Logger,
+): Promise<Response> {
+  const incomingUrl = new URL(req.url);
+  const targetUrl = new URL(masqueradeUrl);
+  targetUrl.pathname = incomingUrl.pathname;
+  targetUrl.search = incomingUrl.search;
+
+  const headers = new Headers(req.headers);
+  headers.set("host", targetUrl.host);
+
+  const outboundRequest = new Request(targetUrl.toString(), {
+    method: req.method,
+    headers,
+    body: req.body,
+    redirect: "follow",
+  });
+
+  try {
+    const response = await fetch(outboundRequest);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  } catch (error) {
+    logger.error("Masquerade proxy failed", error);
+    return new Response("Service Unavailable", { status: 503 });
+  }
 }
 
 async function handleVlessConnection(
@@ -107,7 +155,7 @@ async function handleVlessConnection(
       if (!vlessHeaderProcessed) {
         if (chunk.length < 17) {
           // Data terlalu pendek untuk validasi UUID
-          ws.close();
+          await tarpitAndClose(ws);
           return;
         }
 
@@ -124,7 +172,7 @@ async function handleVlessConnection(
 
         if (!isMatch) {
           logger.error("UUID mismatch");
-          ws.close();
+          await tarpitAndClose(ws);
           return;
         }
 
@@ -228,6 +276,22 @@ async function handleVlessConnection(
       if (remoteConnection) remoteConnection.close();
     } catch (_) {}
   }
+}
+
+async function tarpitAndClose(ws: WebSocket) {
+  if (ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  const garbage = new Uint8Array(256);
+  crypto.getRandomValues(garbage);
+  try {
+    ws.send(garbage);
+  } catch (_) {
+    ws.close();
+    return;
+  }
+  await delay(TARPIT_DELAY_MS);
+  ws.close();
 }
 
 /**

@@ -3,4 +3,9 @@ import { startVlessServer } from "./server.ts";
 
 const config = loadConfig();
 
-startVlessServer({ port: config.port, uuid: config.uuid, logger: config.logger });
+startVlessServer({
+  port: config.port,
+  uuid: config.uuid,
+  masqueradeUrl: config.masqueradeUrl,
+  logger: config.logger,
+});
