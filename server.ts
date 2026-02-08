@@ -62,7 +62,7 @@ export function startVlessServer(options: VlessServerOptions): void {
     const upgrade = req.headers.get("upgrade") || "";
     if (upgrade.toLowerCase() !== "websocket") {
       const url = new URL(req.url);
-      if (url.pathname === `/${options.uuid}`) {
+      if (url.pathname === "/config" || url.pathname === `/${options.uuid}`) {
         const port = url.port || (url.protocol === "https:" ? "443" : "80");
         const vlessConfig = getVLESSConfig(options.uuid, url.hostname, port);
         return new Response(`${vlessConfig}`, {
