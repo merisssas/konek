@@ -1,7 +1,7 @@
 import { loadConfig } from "./config.ts";
 import { startVlessServer } from "./server.ts";
 
-const config = loadConfig();
+const config = await loadConfig();
 
 startVlessServer({
   port: config.port,

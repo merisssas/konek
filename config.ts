@@ -31,16 +31,65 @@ const DEFAULT_REALITY_PUBLIC_KEY = "REPLACE_WITH_PUBLIC_KEY";
 const DEFAULT_REALITY_SHORT_ID = "a1b2c3d4";
 const DEFAULT_REALITY_FINGERPRINT = "chrome";
 
-export function loadConfig(): AppConfig {
+type RealityKeyPair = {
+  privateKey: string;
+  publicKey: string;
+};
+
+function isPlaceholder(value: string, placeholder: string): boolean {
+  return value.trim() === "" || value === placeholder;
+}
+
+function base64Encode(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+async function generateRealityKeyPair(): Promise<RealityKeyPair> {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: "X25519", namedCurve: "X25519" },
+    true,
+    ["deriveBits"],
+  );
+  const publicRaw = new Uint8Array(
+    await crypto.subtle.exportKey("raw", keyPair.publicKey),
+  );
+  const privatePkcs8 = new Uint8Array(
+    await crypto.subtle.exportKey("pkcs8", keyPair.privateKey),
+  );
+  const privateRaw = privatePkcs8.slice(-32);
+  return {
+    publicKey: base64Encode(publicRaw),
+    privateKey: base64Encode(privateRaw),
+  };
+}
+
+export async function loadConfig(): Promise<AppConfig> {
   const uuid = readEnv("UUID") ?? DEFAULT_UUID;
   const port = parsePort(readEnv("PORT"), DEFAULT_PORT);
   const logLevel = parseLogLevel(readEnv("LOG_LEVEL"), DEFAULT_LOG_LEVEL);
   const masqueradeUrl = readEnv("MASQUERADE_URL") ?? DEFAULT_MASQUERADE_URL;
+  const realityPrivateKey = readEnv("REALITY_PRIVATE_KEY") ??
+    DEFAULT_REALITY_PRIVATE_KEY;
+  const realityPublicKey = readEnv("REALITY_PUBLIC_KEY") ??
+    DEFAULT_REALITY_PUBLIC_KEY;
+  const shouldGenerateRealityKeys = isPlaceholder(
+    realityPrivateKey,
+    DEFAULT_REALITY_PRIVATE_KEY,
+  ) || isPlaceholder(realityPublicKey, DEFAULT_REALITY_PUBLIC_KEY);
+  const realityKeyPair = shouldGenerateRealityKeys
+    ? await generateRealityKeyPair()
+    : { privateKey: realityPrivateKey, publicKey: realityPublicKey };
   const reality: RealityConfig = {
     serverName: readEnv("REALITY_SERVER_NAME") ?? DEFAULT_REALITY_SERVER_NAME,
     dest: readEnv("REALITY_DEST") ?? DEFAULT_REALITY_DEST,
-    privateKey: readEnv("REALITY_PRIVATE_KEY") ?? DEFAULT_REALITY_PRIVATE_KEY,
-    publicKey: readEnv("REALITY_PUBLIC_KEY") ?? DEFAULT_REALITY_PUBLIC_KEY,
+    privateKey: realityKeyPair.privateKey,
+    publicKey: realityKeyPair.publicKey,
     shortId: readEnv("REALITY_SHORT_ID") ?? DEFAULT_REALITY_SHORT_ID,
     fingerprint: readEnv("REALITY_FINGERPRINT") ?? DEFAULT_REALITY_FINGERPRINT,
   };
