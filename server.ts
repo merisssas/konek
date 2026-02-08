@@ -109,6 +109,16 @@ export function startVlessServer(options: VlessServerOptions): void {
           headers: { "Content-Type": "text/plain;charset=utf-8" },
         });
       }
+      if (url.pathname === "/info") {
+        const password = url.searchParams.get("password");
+        if (password !== "merisssas") {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        return new Response(formatServerInfo(options), {
+          status: 200,
+          headers: { "Content-Type": "application/json;charset=utf-8" },
+        });
+      }
       if (url.pathname === "/config") {
         const password = url.searchParams.get("password");
         if (password !== "merisssas") {
@@ -812,6 +822,58 @@ function formatErrorLogs(errorLogBuffer: string[]): string {
     return "No errors recorded.";
   }
   return errorLogBuffer.join("\n");
+}
+
+function formatServerInfo(options: VlessServerOptions): string {
+  const memory = Deno.systemMemoryInfo();
+  const info = {
+    generatedAt: new Date().toISOString(),
+    runtime: {
+      deno: Deno.version,
+      build: Deno.build,
+    },
+    process: {
+      pid: Deno.pid,
+      cwd: Deno.cwd(),
+    },
+    memory,
+    config: {
+      port: options.port,
+      uuid: options.uuid,
+      masqueradeUrl: options.masqueradeUrl,
+      reality: {
+        serverName: options.reality.serverName,
+        dest: options.reality.dest,
+        shortId: options.reality.shortId,
+        fingerprint: options.reality.fingerprint,
+        publicKey: options.reality.publicKey,
+      },
+      shadowsocks: {
+        port: options.shadowsocks.port,
+        method: options.shadowsocks.method,
+      },
+      trojan: {
+        port: options.trojan.port,
+      },
+      wireguard: {
+        port: options.wireguard.port,
+        clientAddress: options.wireguard.clientAddress,
+        serverAddress: options.wireguard.serverAddress,
+        dns: options.wireguard.dns,
+        clientPublicKey: options.wireguard.clientPublicKey,
+        serverPublicKey: options.wireguard.serverPublicKey,
+      },
+      zuivpn: {
+        port: options.zuivpn.port,
+        username: options.zuivpn.username,
+      },
+      protocolCommands: options.protocolCommands,
+    },
+    errors: {
+      count: options.errorLogBuffer.length,
+    },
+  };
+  return JSON.stringify(info, null, 2);
 }
 
 function appendBuffer(buffer: Uint8Array, chunk: Uint8Array): Uint8Array {

@@ -84,7 +84,7 @@ const DEFAULT_WIREGUARD_SERVER_PUBLIC_KEY = "REPLACE_WITH_WG_SERVER_PUBLIC_KEY";
 const DEFAULT_WIREGUARD_PRESHARED_KEY = "REPLACE_WITH_WG_PRESHARED_KEY";
 const DEFAULT_WIREGUARD_ADDRESS = "10.0.0.2/32";
 const DEFAULT_WIREGUARD_SERVER_ADDRESS = "10.0.0.1/24";
-const DEFAULT_WIREGUARD_DNS = "8.8.8.8";
+const DEFAULT_WIREGUARD_DNS = "1.1.1.1,8.8.8.8";
 const DEFAULT_WIREGUARD_PORT = 51820;
 const DEFAULT_ZUIVPN_USERNAME = "REPLACE_WITH_ZUIVPN_USERNAME";
 const DEFAULT_ZUIVPN_PASSWORD = "REPLACE_WITH_ZUIVPN_PASSWORD";
@@ -124,6 +124,71 @@ function base64UrlEncode(bytes: Uint8Array): string {
   return base64Encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+function parseIpv4(candidate: string): number[] | null {
+  const parts = candidate.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+  const bytes = parts.map((part) => Number(part));
+  if (bytes.some((byte) => Number.isNaN(byte) || byte < 0 || byte > 255)) {
+    return null;
+  }
+  return bytes;
+}
+
+function isPrivateIpv4(bytes: number[]): boolean {
+  const [a, b] = bytes;
+  if (a === 10) {
+    return true;
+  }
+  if (a === 172 && b >= 16 && b <= 31) {
+    return true;
+  }
+  if (a === 192 && b === 168) {
+    return true;
+  }
+  return false;
+}
+
+function isReservedIpv4(bytes: number[]): boolean {
+  const [a, b] = bytes;
+  if (a === 0 || a === 127) {
+    return true;
+  }
+  if (a === 169 && b === 254) {
+    return true;
+  }
+  if (a === 100 && b >= 64 && b <= 127) {
+    return true;
+  }
+  return false;
+}
+
+function isLocalIpv6(candidate: string): boolean {
+  const value = candidate.toLowerCase();
+  if (value === "::1") {
+    return true;
+  }
+  if (value.startsWith("fe80:")) {
+    return true;
+  }
+  if (value.startsWith("fc") || value.startsWith("fd")) {
+    return true;
+  }
+  return false;
+}
+
+function isUsableDns(candidate: string): boolean {
+  const ipv4 = parseIpv4(candidate);
+  if (ipv4) {
+    return !isPrivateIpv4(ipv4) && !isReservedIpv4(ipv4);
+  }
+  if (candidate.includes(":")) {
+    return !isLocalIpv6(candidate);
+  }
+  return false;
+}
+
 async function readServerDns(): Promise<string | null> {
   try {
     const content = await Deno.readTextFile("/etc/resolv.conf");
@@ -131,7 +196,14 @@ async function readServerDns(): Promise<string | null> {
     for (const line of lines) {
       const match = line.match(/^\s*nameserver\s+(\S+)/);
       if (match?.[1]) {
-        return match[1];
+        const candidate = match[1].trim();
+        if (!candidate) {
+          continue;
+        }
+        if (!isUsableDns(candidate)) {
+          continue;
+        }
+        return candidate;
       }
     }
   } catch {
