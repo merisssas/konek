@@ -375,35 +375,37 @@ async function handleUdpConnection(
 
   await sendPayload(initialPayload);
 
-  const udpToWs = (async () => {
-    try {
-      for await (const [data] of udpConn) {
+  const udpReadable = createDatagramReadableStream(udpConn, logger);
+  const udpToWs = udpReadable.pipeTo(
+    new WritableStream<Uint8Array>({
+      write(chunk) {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data);
-        } else {
-          break;
+          ws.send(chunk);
+          return;
         }
-      }
-    } catch (error) {
-      logger.warn("UDP receive failed", error);
-    }
-  })();
+        throw new Error("WebSocket closed");
+      },
+      close() {
+        try {
+          ws.close();
+        } catch (_) {}
+      },
+      abort() {
+        try {
+          ws.close();
+        } catch (_) {}
+      },
+    }),
+  );
 
-  const wsToUdp = (async () => {
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
-        if (value) {
-          await sendPayload(value);
-        }
-      }
-    } catch (error) {
-      logger.warn("WebSocket to UDP failed", error);
-    }
-  })();
+  const wsReadable = createReadableStreamFromReader(reader, initialPayload);
+  const wsToUdp = wsReadable.pipeTo(
+    new WritableStream<Uint8Array>({
+      async write(chunk) {
+        await sendPayload(chunk);
+      },
+    }),
+  );
 
   await Promise.race([udpToWs, wsToUdp]);
   try {
@@ -439,6 +441,30 @@ function createReadableStreamFromReader(
     },
     cancel() {
       reader.cancel().catch(() => {});
+    },
+  });
+}
+
+function createDatagramReadableStream(
+  udpConn: Deno.DatagramConn,
+  logger: Logger,
+): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let failed = false;
+      try {
+        for await (const [data] of udpConn) {
+          controller.enqueue(data);
+        }
+      } catch (error) {
+        logger.warn("UDP receive failed", error);
+        failed = true;
+        controller.error(error);
+      } finally {
+        if (!failed) {
+          controller.close();
+        }
+      }
     },
   });
 }
@@ -835,11 +861,6 @@ function parseVlessHeader(
     address = parts.join(":");
   } else {
     logger.error(`Unknown address type: ${addrType}`);
-    return { status: "invalid" };
-  }
-
-  if (isBlockedAddress(address)) {
-    logger.warn(`Blocked private/loopback address: ${address}`);
     return { status: "invalid" };
   }
 
