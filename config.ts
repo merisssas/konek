@@ -43,30 +43,6 @@ function isPlaceholder(value: string, placeholder: string): boolean {
   return value.trim() === "" || value === placeholder;
 }
 
-function randomBytes(length: number): Uint8Array {
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  return bytes;
-}
-
-function base64Encode(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-  return btoa(binary);
-}
-
-function base64UrlEncode(bytes: Uint8Array): string {
-  return base64Encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function generateToken(length: number): string {
-  return base64UrlEncode(randomBytes(length));
-}
-
 export async function loadConfig(): Promise<AppConfig> {
   const uuid = readEnv("UUID") ?? DEFAULT_UUID;
   const port = parsePort(readEnv("PORT"), DEFAULT_PORT);
@@ -79,7 +55,7 @@ export async function loadConfig(): Promise<AppConfig> {
     rawShadowsocksPassword,
     DEFAULT_SHADOWSOCKS_PASSWORD,
   )
-    ? generateToken(32)
+    ? uuid
     : rawShadowsocksPassword;
   const shadowsocks: ShadowsocksConfig = {
     method: readEnv("SHADOWSOCKS_METHOD") ?? DEFAULT_SHADOWSOCKS_METHOD,
@@ -92,7 +68,7 @@ export async function loadConfig(): Promise<AppConfig> {
     rawTrojanPassword,
     DEFAULT_TROJAN_PASSWORD,
   )
-    ? generateToken(32)
+    ? uuid
     : rawTrojanPassword;
   const trojan: TrojanConfig = {
     password: trojanPassword,
