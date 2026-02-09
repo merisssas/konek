@@ -180,7 +180,7 @@ async function handleHttpRequest(
     return Response.redirect(options.masqueradeUrl, 302);
   }
   if (url.pathname === "/error") {
-    return new Response(formatErrorLogs(options.errorLogBuffer), {
+    return new Response(formatErrorReport(req, options), {
       status: 200,
       headers: { "Content-Type": "text/plain;charset=utf-8" },
     });
@@ -811,6 +811,77 @@ function formatErrorLogs(errorLogBuffer: string[]): string {
     return "No errors recorded.";
   }
   return errorLogBuffer.join("\n");
+}
+
+function formatErrorReport(
+  req: Request,
+  options: VlessServerOptions,
+): string {
+  const now = new Date().toISOString();
+  const memory = Deno.systemMemoryInfo();
+  const requestHeaders = formatHeaders(req.headers);
+  const errors = formatErrorLogs(options.errorLogBuffer);
+  return [
+    "Konek Debug Report",
+    "===================",
+    `Generated at : ${now}`,
+    "",
+    "Request",
+    "-------",
+    `Method        : ${req.method}`,
+    `URL           : ${req.url}`,
+    `Headers       :`,
+    requestHeaders,
+    "",
+    "Runtime",
+    "-------",
+    `Deno          : ${Deno.version.deno}`,
+    `V8            : ${Deno.version.v8}`,
+    `TypeScript    : ${Deno.version.typescript}`,
+    `OS            : ${Deno.build.os}`,
+    `Arch          : ${Deno.build.arch}`,
+    "",
+    "Process",
+    "-------",
+    `PID           : ${Deno.pid}`,
+    `CWD           : ${Deno.cwd()}`,
+    "",
+    "Memory",
+    "------",
+    `Total         : ${memory.total}`,
+    `Free          : ${memory.free}`,
+    `Available     : ${memory.available}`,
+    `SwapTotal     : ${memory.swapTotal}`,
+    `SwapFree      : ${memory.swapFree}`,
+    "",
+    "Config",
+    "------",
+    `Port          : ${options.port}`,
+    `UUID          : ${options.uuid}`,
+    `MasqueradeUrl : ${options.masqueradeUrl}`,
+    `Shadowsocks   : ${options.shadowsocks.method} on ${options.shadowsocks.port}`,
+    `Trojan        : port ${options.trojan.port}`,
+    `Commands      : shadowsocks=${options.protocolCommands.shadowsocks ?? "-"} | trojan=${options.protocolCommands.trojan ?? "-"}`,
+    "",
+    "Errors",
+    "------",
+    errors,
+    "",
+  ].join("\n");
+}
+
+function formatHeaders(headers: Headers): string {
+  const lines: string[] = [];
+  const redacted = new Set(["authorization", "cookie", "set-cookie"]);
+  for (const [key, value] of headers.entries()) {
+    const lowerKey = key.toLowerCase();
+    const displayValue = redacted.has(lowerKey) ? "[redacted]" : value;
+    lines.push(`  ${key}: ${displayValue}`);
+  }
+  if (lines.length === 0) {
+    return "  (none)";
+  }
+  return lines.join("\n");
 }
 
 function formatServerInfo(options: VlessServerOptions): string {
