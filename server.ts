@@ -19,7 +19,10 @@ export type VlessServerOptions = {
 
 const textDecoder = new TextDecoder();
 const MEMORY_USAGE_LIMIT = 0.9;
-const TARPIT_DELAY_MS = 2000;
+const TARPIT_DELAY_MIN_MS = 1000;
+const TARPIT_DELAY_MAX_MS = 5000;
+const TARPIT_GARBAGE_MIN_BYTES = 100;
+const TARPIT_GARBAGE_MAX_BYTES = 600;
 const MAX_WS_QUEUE_BYTES = 4 * 1024 * 1024;
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -205,8 +208,6 @@ async function handleVlessConnection(
   logger: Logger,
 ) {
   let vlessHeaderProcessed = false;
-  let remoteConnection: Deno.TcpConn | null = null;
-  let remoteWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   let handshakeBuffer = new Uint8Array(0);
 
   // Stream untuk membaca data dari WebSocket
@@ -236,33 +237,18 @@ async function handleVlessConnection(
         // console.log(`Connecting to ${address}:${port} (${command === 1 ? 'TCP' : 'UDP'})`);
 
         // --- TAHAP 2: Koneksi ke Tujuan (Remote) ---
-        try {
-          if (parsed.command === 1) { // TCP
-            remoteConnection = await Deno.connect({
-              hostname: parsed.address,
-              port: parsed.port,
-            });
-            try {
-              remoteConnection.setNoDelay(true);
-            } catch (_) {
-              // Ignore if not supported
-            }
-          } else {
-            // UDP belum didukung penuh secara stabil di mode ini tanpa muxing kompleks
-            logger.error("UDP request not supported in this simple VLESS handler");
-            ws.close();
-            return;
-          }
-        } catch (err) {
-          logger.error(
-            `Failed to connect to remote ${parsed.address}:${parsed.port}`,
-            err,
+        const resolvedTarget = await resolveTargetAddress(parsed.address, logger);
+        if (!resolvedTarget) {
+          ws.close();
+          return;
+        }
+        if (isBlockedAddress(resolvedTarget)) {
+          logger.warn(
+            `Blocked resolved IP: ${resolvedTarget} from ${parsed.address}`,
           );
           ws.close();
           return;
         }
-
-        remoteWriter = remoteConnection.writable.getWriter();
 
         // --- TAHAP 3: Kirim Respons VLESS ke Client ---
         // Response format: [Version(1)][AddonsLen(1)][Addons(0)]
@@ -274,57 +260,197 @@ async function handleVlessConnection(
           return;
         }
 
-        // --- TAHAP 4: Kirim Sisa Data (Payload) ke Remote ---
-        // Data payload dimulai tepat setelah alamat
-        const payload = handshakeBuffer.subarray(parsed.payloadOffset);
-        if (payload.length > 0) {
-          try {
-            await remoteWriter.write(payload);
-          } catch (_) {
-            ws.close();
-            return;
-          }
-        }
-
         vlessHeaderProcessed = true;
+        const payload = handshakeBuffer.subarray(parsed.payloadOffset);
         handshakeBuffer = new Uint8Array(0);
 
-        // --- TAHAP 5: Setup Pipa Balik (Remote -> WebSocket) ---
-        // Kita tidak await ini agar loop pembacaan WS tidak terblokir
-        pipeRemoteToWs(remoteConnection, ws, logger).catch((error) => {
-          logger.warn("Remote to WebSocket pipe failed", error);
-        });
-
-      } else {
-        // --- TAHAP 6: Data Lanjutan (Setelah Handshake) ---
-        // Langsung kirim raw data ke remote socket
-        if (remoteWriter) {
+        if (parsed.command === 1) {
+          let remoteConnection: Deno.TcpConn;
           try {
-            await remoteWriter.write(chunk);
-          } catch (_) {
+            remoteConnection = await Deno.connect({
+              hostname: resolvedTarget,
+              port: parsed.port,
+            });
+            try {
+              remoteConnection.setNoDelay(true);
+            } catch (_) {
+              // Ignore if not supported
+            }
+          } catch (err) {
+            logger.error(
+              `Failed to connect to remote ${parsed.address}:${parsed.port}`,
+              err,
+            );
             ws.close();
             return;
           }
+
+          const wsToRemoteStream = createReadableStreamFromReader(
+            reader,
+            payload,
+          );
+
+          const remoteReadable = remoteConnection.readable;
+          const remoteWritable = remoteConnection.writable;
+
+          try {
+            await Promise.all([
+              remoteReadable.pipeTo(
+                new WritableStream({
+                  write(chunk) {
+                    if (ws.readyState === WebSocket.OPEN) {
+                      ws.send(chunk);
+                    }
+                  },
+                  close() {
+                    try {
+                      ws.close();
+                    } catch (_) {}
+                  },
+                  abort() {
+                    try {
+                      ws.close();
+                    } catch (_) {}
+                  },
+                }),
+              ),
+              wsToRemoteStream.pipeTo(remoteWritable),
+            ]);
+          } catch (error) {
+            logger.warn("Bidirectional pipe failed", error);
+          } finally {
+            try {
+              remoteConnection.close();
+            } catch (_) {}
+          }
+          return;
+        }
+
+        if (parsed.command === 2) {
+          await handleUdpConnection(
+            ws,
+            reader,
+            payload,
+            resolvedTarget,
+            parsed.port,
+            logger,
+          );
+          return;
         }
       }
     }
   } catch (err) {
-    // Error pada stream reader atau penulisan
-    // console.error("Stream error:", err);
-  } finally {
-    // Bersihkan resource
-    try {
-      if (remoteWriter) remoteWriter.releaseLock();
-      if (remoteConnection) remoteConnection.close();
-    } catch (_) {}
+    logger.warn("WebSocket stream error", err);
   }
+}
+
+async function handleUdpConnection(
+  ws: WebSocket,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  initialPayload: Uint8Array,
+  address: string,
+  port: number,
+  logger: Logger,
+) {
+  const udpConn = Deno.listenDatagram({
+    port: 0,
+    transport: "udp",
+    hostname: "0.0.0.0",
+  });
+
+  const sendPayload = async (payload: Uint8Array) => {
+    if (payload.length === 0) {
+      return;
+    }
+    try {
+      await udpConn.send(payload, {
+        transport: "udp",
+        hostname: address,
+        port,
+      });
+    } catch (error) {
+      logger.warn("UDP send failed", error);
+    }
+  };
+
+  await sendPayload(initialPayload);
+
+  const udpToWs = (async () => {
+    try {
+      for await (const [data] of udpConn) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(data);
+        } else {
+          break;
+        }
+      }
+    } catch (error) {
+      logger.warn("UDP receive failed", error);
+    }
+  })();
+
+  const wsToUdp = (async () => {
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value) {
+          await sendPayload(value);
+        }
+      }
+    } catch (error) {
+      logger.warn("WebSocket to UDP failed", error);
+    }
+  })();
+
+  await Promise.race([udpToWs, wsToUdp]);
+  try {
+    udpConn.close();
+  } catch (_) {}
+  try {
+    ws.close();
+  } catch (_) {}
+}
+
+function createReadableStreamFromReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  initialPayload: Uint8Array,
+): ReadableStream<Uint8Array> {
+  let sentInitial = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!sentInitial) {
+        sentInitial = true;
+        if (initialPayload.length > 0) {
+          controller.enqueue(initialPayload);
+          return;
+        }
+      }
+      const { value, done } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      if (value) {
+        controller.enqueue(value);
+      }
+    },
+    cancel() {
+      reader.cancel().catch(() => {});
+    },
+  });
 }
 
 async function tarpitAndClose(ws: WebSocket) {
   if (ws.readyState !== WebSocket.OPEN) {
     return;
   }
-  const garbage = new Uint8Array(256);
+  const garbageSize = Math.floor(
+    Math.random() * (TARPIT_GARBAGE_MAX_BYTES - TARPIT_GARBAGE_MIN_BYTES + 1),
+  ) + TARPIT_GARBAGE_MIN_BYTES;
+  const garbage = new Uint8Array(garbageSize);
   crypto.getRandomValues(garbage);
   try {
     ws.send(garbage);
@@ -332,41 +458,11 @@ async function tarpitAndClose(ws: WebSocket) {
     ws.close();
     return;
   }
-  await delay(TARPIT_DELAY_MS);
+  const randomDelay = Math.floor(
+    Math.random() * (TARPIT_DELAY_MAX_MS - TARPIT_DELAY_MIN_MS + 1),
+  ) + TARPIT_DELAY_MIN_MS;
+  await delay(randomDelay);
   ws.close();
-}
-
-/**
- * Fungsi untuk memompa data dari Remote TCP kembali ke WebSocket Client
- */
-async function pipeRemoteToWs(
-  remoteConn: Deno.TcpConn,
-  ws: WebSocket,
-  logger: Logger,
-) {
-  const buffer = new Uint8Array(64 * 1024);
-  try {
-    while (true) {
-      let bytesRead: number | null;
-      try {
-        bytesRead = await remoteConn.read(buffer);
-      } catch (_) {
-        break;
-      }
-      if (bytesRead === null) break;
-      if (bytesRead === 0) continue;
-      if (ws.readyState !== WebSocket.OPEN) break;
-      try {
-        ws.send(buffer.subarray(0, bytesRead));
-      } catch (_) {
-        break;
-      }
-    }
-  } catch (error) {
-    logger.warn("Remote read error", error);
-  } finally {
-    try { ws.close(); } catch (_) {}
-  }
 }
 
 function parseWebSocketProtocolHeader(
@@ -436,7 +532,7 @@ clash-meta
   uuid: ${userID}
   network: ws
   tls: true
-  udp: false
+  udp: true
   sni: ${hostName}
   client-fingerprint: chrome
   ws-opts:
@@ -687,8 +783,8 @@ function parseVlessHeader(
     return { status: "need_more" };
   }
   const command = buffer[commandIndex];
-  if (command !== 1) {
-    logger.warn("UDP request not supported in this simple VLESS handler");
+  if (command !== 1 && command !== 2) {
+    logger.warn(`Unsupported command: ${command}`);
     return { status: "invalid" };
   }
 
@@ -773,6 +869,28 @@ function isBlockedAddress(address: string): boolean {
     return true;
   }
   return false;
+}
+
+async function resolveTargetAddress(
+  address: string,
+  logger: Logger,
+): Promise<string | null> {
+  if (address.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(address)) {
+    return address;
+  }
+  try {
+    const records = await Deno.resolveDns(address, "A");
+    if (records.length > 0) {
+      return records[0];
+    }
+    const recordsV6 = await Deno.resolveDns(address, "AAAA");
+    if (recordsV6.length > 0) {
+      return recordsV6[0];
+    }
+  } catch (error) {
+    logger.warn(`DNS resolve failed for ${address}`, error);
+  }
+  return null;
 }
 
 function isPrivateIpv4(address: string): boolean {
