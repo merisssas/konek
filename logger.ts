@@ -58,7 +58,7 @@ function formatLogEntry(levelName: LogLevel, args: unknown[]): string {
   return `[${timestamp}] [${levelName}] ${message}`;
 }
 
-export function createErrorLogBuffer(
+function createErrorLogBuffer(
   maxEntries: number = MAX_ERROR_LOGS,
 ): ErrorLogBuffer {
   const buffer: string[] = [];
@@ -74,25 +74,28 @@ export function createErrorLogBuffer(
   };
 }
 
-export function createLogger(
-  level: LogLevel,
-  errorSink?: ErrorLogBuffer,
-): Logger {
+export type LoggerBundle = {
+  logger: Logger;
+  errorLogBuffer: ErrorLogBuffer;
+};
+
+export function createLogger(level: LogLevel): LoggerBundle {
+  const errorLogBuffer = createErrorLogBuffer();
   const recordError = (...args: unknown[]) => {
-    if (!errorSink) {
-      return;
-    }
-    errorSink.add(formatLogEntry("error", args));
+    errorLogBuffer.add(formatLogEntry("error", args));
   };
 
   if (level === "none") {
     return {
-      debug: () => {},
-      info: () => {},
-      warn: () => {},
-      error: (...args: unknown[]) => {
-        recordError(...args);
+      logger: {
+        debug: () => {},
+        info: () => {},
+        warn: () => {},
+        error: (...args: unknown[]) => {
+          recordError(...args);
+        },
       },
+      errorLogBuffer,
     };
   }
   const threshold = LOG_LEVEL_PRIORITY[level];
@@ -110,9 +113,12 @@ export function createLogger(
   };
 
   return {
-    debug: emit("debug", console.debug),
-    info: emit("info", console.info),
-    warn: emit("warn", console.warn),
-    error: emit("error", console.error),
+    logger: {
+      debug: emit("debug", console.debug),
+      info: emit("info", console.info),
+      warn: emit("warn", console.warn),
+      error: emit("error", console.error),
+    },
+    errorLogBuffer,
   };
 }

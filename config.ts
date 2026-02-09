@@ -1,7 +1,5 @@
 import {
-  createErrorLogBuffer,
   createLogger,
-  type ErrorLogBuffer,
   type LogLevel,
   type Logger,
 } from "./logger.ts";
@@ -22,7 +20,7 @@ export type AppConfig = {
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
   protocolCommands: ProtocolCommandConfig;
-  errorLogBuffer: ErrorLogBuffer;
+  errorLogBuffer: ReturnType<typeof createLogger>["errorLogBuffer"];
   logger: Logger;
 };
 
@@ -44,10 +42,10 @@ export type ProtocolCommandConfig = {
 
 const DEFAULT_UUID = "841b9534-793e-4363-9976-59915e6659f4";
 const DEFAULT_PORT = 8080;
-const DEFAULT_LOG_LEVEL: LogLevel = "none";
+const STEALTH_LOG_LEVEL: LogLevel = "error";
 const DEFAULT_VERBOSE_LOG_LEVEL: LogLevel = "debug";
 const DEFAULT_STEALTH_MODE = true;
-const DEFAULT_MASQUERADE_URL = "https://www.microsoft.com/";
+const DEFAULT_MASQUERADE_URL = "https://dl.google.com/";
 const DEFAULT_SHADOWSOCKS_METHOD = "chacha20-ietf-poly1305";
 const DEFAULT_SHADOWSOCKS_PASSWORD = "REPLACE_WITH_SHADOWSOCKS_PASSWORD";
 const DEFAULT_SHADOWSOCKS_PORT = 8388;
@@ -58,6 +56,32 @@ function isPlaceholder(value: string, placeholder: string): boolean {
   return value.trim() === "" || value === placeholder;
 }
 
+function resolvePassword(
+  value: string,
+  placeholder: string,
+  fallback: string,
+): string {
+  return isPlaceholder(value, placeholder) ? fallback : value;
+}
+
+function validateMasqueradeUrl(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`MASQUERADE_URL is not a valid URL: ${value}`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(
+      `MASQUERADE_URL must use http/https protocol: ${value}`,
+    );
+  }
+  if (!parsed.hostname) {
+    throw new Error(`MASQUERADE_URL must include a hostname: ${value}`);
+  }
+  return parsed.toString();
+}
+
 export async function loadConfig(): Promise<AppConfig> {
   const uuid = readEnv("UUID") ?? DEFAULT_UUID;
   const port = parsePort(readEnv("PORT"), DEFAULT_PORT);
@@ -66,18 +90,19 @@ export async function loadConfig(): Promise<AppConfig> {
     DEFAULT_STEALTH_MODE,
   );
   const logLevel = stealthMode
-    ? DEFAULT_LOG_LEVEL
+    ? STEALTH_LOG_LEVEL
     : parseLogLevel(readEnv("LOG_LEVEL"), DEFAULT_VERBOSE_LOG_LEVEL);
-  const masqueradeUrl = readEnv("MASQUERADE_URL") ?? DEFAULT_MASQUERADE_URL;
+  const masqueradeUrl = validateMasqueradeUrl(
+    readEnv("MASQUERADE_URL") ?? DEFAULT_MASQUERADE_URL,
+  );
 
   const rawShadowsocksPassword = readEnv("SHADOWSOCKS_PASSWORD") ??
     DEFAULT_SHADOWSOCKS_PASSWORD;
-  const shadowsocksPassword = isPlaceholder(
+  const shadowsocksPassword = resolvePassword(
     rawShadowsocksPassword,
     DEFAULT_SHADOWSOCKS_PASSWORD,
-  )
-    ? uuid
-    : rawShadowsocksPassword;
+    uuid,
+  );
   const shadowsocks: ShadowsocksConfig = {
     method: readEnv("SHADOWSOCKS_METHOD") ?? DEFAULT_SHADOWSOCKS_METHOD,
     password: shadowsocksPassword,
@@ -85,12 +110,11 @@ export async function loadConfig(): Promise<AppConfig> {
   };
 
   const rawTrojanPassword = readEnv("TROJAN_PASSWORD") ?? DEFAULT_TROJAN_PASSWORD;
-  const trojanPassword = isPlaceholder(
+  const trojanPassword = resolvePassword(
     rawTrojanPassword,
     DEFAULT_TROJAN_PASSWORD,
-  )
-    ? uuid
-    : rawTrojanPassword;
+    uuid,
+  );
   const trojan: TrojanConfig = {
     password: trojanPassword,
     port: parsePort(readEnv("TROJAN_PORT"), DEFAULT_TROJAN_PORT),
@@ -104,14 +128,7 @@ export async function loadConfig(): Promise<AppConfig> {
     throw new Error(`UUID is not valid: ${uuid}`);
   }
 
-  const errorLogBuffer = createErrorLogBuffer();
-  const logger = createLogger(logLevel, errorLogBuffer);
-
-  try {
-    new URL(masqueradeUrl);
-  } catch {
-    throw new Error(`MASQUERADE_URL is not a valid URL: ${masqueradeUrl}`);
-  }
+  const { logger, errorLogBuffer } = createLogger(logLevel);
 
   return {
     uuid,
