@@ -4,7 +4,7 @@ import type {
   TrojanConfig,
   ProtocolCommandConfig,
 } from "./config.ts";
-import { isValidUUID } from "./utils.ts";
+import { maskIP, uuidToBytes } from "./utils.ts";
 
 export type VlessServerOptions = {
   port: number;
@@ -50,24 +50,12 @@ const FORWARDED_HEADER_PREFIXES = [
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Mengonversi string UUID menjadi Uint8Array untuk validasi binary
- */
-function uuidToBytes(uuid: string): Uint8Array {
-  const hex = uuid.replace(/-/g, "");
-  const bytes = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) {
-    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-  }
-  return bytes;
-}
-
 export function startVlessServer(options: VlessServerOptions): void {
-  if (!isValidUUID(options.uuid)) {
+  const validUUIDBytes = uuidToBytes(options.uuid);
+  if (!validUUIDBytes) {
     throw new Error("UUID is not valid");
   }
   const logger = options.logger ?? console;
-  const validUUIDBytes = uuidToBytes(options.uuid);
   logger.info(`🚀 VLESS server listening on :${options.port} [UDP: ON]`);
   startTcpProtocolService(
     "shadowsocks",
@@ -242,8 +230,10 @@ async function processVlessSession(
 
         const resolvedTarget = await resolveTargetAddress(parsed.address, logger);
         if (!resolvedTarget || isBlockedAddress(resolvedTarget)) {
+          const maskedAddress = maskIP(parsed.address);
+          const maskedTarget = resolvedTarget ? maskIP(resolvedTarget) : "null";
           logger.warn(
-            `Blocked or unresolved target: ${parsed.address} -> ${resolvedTarget}`,
+            `Blocked or unresolved target: ${maskedAddress} -> ${maskedTarget}`,
           );
           ws.close();
           return;
@@ -309,7 +299,7 @@ async function handleTcpPipe(
       remoteConn.setKeepAlive(true);
     } catch (_) {}
   } catch (error) {
-    logger.warn(`TCP connect failed: ${address}:${port}`, error);
+    logger.warn(`TCP connect failed: ${maskIP(address)}:${port}`, error);
     try {
       ws.close();
     } catch (_) {}
@@ -896,7 +886,7 @@ async function resolveTargetAddress(
       return recordsV6[0];
     }
   } catch (error) {
-    logger.warn(`DNS resolve failed for ${address}`, error);
+    logger.warn(`DNS resolve failed for ${maskIP(address)}`, error);
   }
   return null;
 }
