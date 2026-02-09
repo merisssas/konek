@@ -44,7 +44,6 @@ const UDP_IDLE_TIMEOUT_MS = 15_000;
 const UDP_IDLE_CHECK_INTERVAL_MS = 1_000;
 const DNS_CACHE_TTL_MS = 60_000;
 const DNS_CACHE_MAX_ENTRIES = 500;
-const DNS_CACHE_SWEEP_LIMIT = 25;
 const DNS_MAX_RESOLVES_PER_SESSION = 4;
 const DOH_TIMEOUT_MS = 1500;
 const DNS_FALLBACK_TIMEOUT_MS = 2500;
@@ -80,18 +79,6 @@ const FORWARDED_HEADER_PREFIXES = [
 ];
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const safeCancelReadableStream = (
-  stream: ReadableStream<Uint8Array>,
-  reason: string,
-) => {
-  if (stream.locked) {
-    return;
-  }
-  try {
-    stream.cancel(reason).catch(() => {});
-  } catch (_) {}
-};
 
 type DnsCacheEntry = {
   value: string | null;
@@ -141,7 +128,7 @@ export function startVlessServer(options: VlessServerOptions): void {
   }
   const logger = options.logger ?? console;
   const sessionLimiter = createSessionLimiter(MAX_CONCURRENT_SESSIONS);
-  logger.info(`🚀 VLESS server listening on :${options.port} [UDP: WS-FRAMED]`);
+  logger.info(`🚀 VLESS server listening on :${options.port} [UDP: ON]`);
   startTcpProtocolService(
     "shadowsocks",
     options.shadowsocks.port,
@@ -262,16 +249,6 @@ function readNumberFromFile(
   }
 }
 
-function adminResponseHeaders(contentType: string): Headers {
-  return new Headers({
-    "Content-Type": contentType,
-    "Cache-Control": "no-store",
-    Pragma: "no-cache",
-    "Referrer-Policy": "no-referrer",
-    "X-Content-Type-Options": "nosniff",
-  });
-}
-
 async function handleHttpRequest(
   req: Request,
   options: VlessServerOptions,
@@ -284,36 +261,27 @@ async function handleHttpRequest(
   if (url.pathname === "/error") {
     const password = url.searchParams.get("password");
     if (password !== options.adminPassword) {
-      return new Response("Unauthorized", {
-        status: 401,
-        headers: adminResponseHeaders("text/plain;charset=utf-8"),
-      });
+      return new Response("Unauthorized", { status: 401 });
     }
     return new Response(formatErrorLogs(options.errorLogBuffer), {
       status: 200,
-      headers: adminResponseHeaders("text/plain;charset=utf-8"),
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
     });
   }
   if (url.pathname === "/info") {
     const password = url.searchParams.get("password");
     if (password !== options.adminPassword) {
-      return new Response("Unauthorized", {
-        status: 401,
-        headers: adminResponseHeaders("text/plain;charset=utf-8"),
-      });
+      return new Response("Unauthorized", { status: 401 });
     }
     return new Response(formatServerInfo(options), {
       status: 200,
-      headers: adminResponseHeaders("application/json;charset=utf-8"),
+      headers: { "Content-Type": "application/json;charset=utf-8" },
     });
   }
   if (url.pathname === "/config") {
     const password = url.searchParams.get("password");
     if (password !== options.adminPassword) {
-      return new Response("Unauthorized", {
-        status: 401,
-        headers: adminResponseHeaders("text/plain;charset=utf-8"),
-      });
+      return new Response("Unauthorized", { status: 401 });
     }
     const port = url.port || (url.protocol === "https:" ? "443" : "80");
     const vlessConfig = getVLESSConfig(
@@ -325,7 +293,7 @@ async function handleHttpRequest(
     );
     return new Response(`${vlessConfig}`, {
       status: 200,
-      headers: adminResponseHeaders("text/plain;charset=utf-8"),
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
     });
   }
   if (url.pathname === `/${options.uuid}`) {
@@ -437,12 +405,7 @@ async function processVlessSession(
           continue;
         }
         if (parsed.status === "invalid") {
-          if (wsReader) {
-            wsReader.cancel("invalid handshake").catch(() => {});
-            wsReader.releaseLock();
-            wsReader = null;
-          }
-          void tarpitAndClose(ws, loadAdvisor).catch(() => {});
+          await tarpitAndClose(ws, loadAdvisor);
           return;
         }
 
@@ -561,7 +524,9 @@ async function handleTcpPipe(
   const closeAll = () => {
     if (closed) return;
     closed = true;
-    safeCancelReadableStream(inputStream, "tcp closed");
+    try {
+      inputStream.cancel("tcp closed");
+    } catch (_) {}
     try {
       remoteConn.close();
     } catch (_) {}
@@ -655,7 +620,9 @@ async function handleUdpPipe(
       return;
     }
     closed = true;
-    safeCancelReadableStream(inputStream, "udp closed");
+    try {
+      inputStream.cancel("udp closed");
+    } catch (_) {}
     try {
       udpConn.close();
     } catch (_) {}
@@ -1241,21 +1208,6 @@ function isBlockedAddress(address: string): boolean {
   return false;
 }
 
-function pickSafeDnsAddress(
-  hostname: string,
-  addresses: string[],
-  logger: Logger,
-): string | null {
-  const safe = addresses.filter((address) => !isBlockedAddress(address));
-  if (safe.length > 0) {
-    return safe[0];
-  }
-  if (addresses.length > 0) {
-    logger.warn(`DNS resolve returned blocked address for ${maskIP(hostname)}`);
-  }
-  return null;
-}
-
 async function resolveTargetAddress(
   address: string,
   dohUrl: string | null,
@@ -1282,24 +1234,19 @@ async function resolveTargetAddress(
         dohUrl,
         DOH_TIMEOUT_MS,
       );
+      if (records.length > 0) {
+        setDnsCache(address, records[0]);
+        return records[0];
+      }
       const recordsV6 = await resolveDnsOverHttps(
         address,
         "AAAA",
         dohUrl,
         DOH_TIMEOUT_MS,
       );
-      const safe = pickSafeDnsAddress(
-        address,
-        [...records, ...recordsV6],
-        logger,
-      );
-      if (safe) {
-        setDnsCache(address, safe);
-        return safe;
-      }
-      if (records.length > 0 || recordsV6.length > 0) {
-        setDnsCache(address, null);
-        return null;
+      if (recordsV6.length > 0) {
+        setDnsCache(address, recordsV6[0]);
+        return recordsV6[0];
       }
     } catch (error) {
       logger.warn(`DoH resolve failed for ${maskIP(address)}`, error);
@@ -1310,22 +1257,17 @@ async function resolveTargetAddress(
       Deno.resolveDns(address, "A"),
       DNS_FALLBACK_TIMEOUT_MS,
     );
+    if (fallbackRecords.length > 0) {
+      setDnsCache(address, fallbackRecords[0]);
+      return fallbackRecords[0];
+    }
     const fallbackRecordsV6 = await withTimeout(
       Deno.resolveDns(address, "AAAA"),
       DNS_FALLBACK_TIMEOUT_MS,
     );
-    const safe = pickSafeDnsAddress(
-      address,
-      [...fallbackRecords, ...fallbackRecordsV6],
-      logger,
-    );
-    if (safe) {
-      setDnsCache(address, safe);
-      return safe;
-    }
-    if (fallbackRecords.length > 0 || fallbackRecordsV6.length > 0) {
-      setDnsCache(address, null);
-      return null;
+    if (fallbackRecordsV6.length > 0) {
+      setDnsCache(address, fallbackRecordsV6[0]);
+      return fallbackRecordsV6[0];
     }
   } catch (error) {
     logger.warn(`DNS resolve failed for ${maskIP(address)}`, error);
@@ -1353,27 +1295,7 @@ function getDnsCache(hostname: string): string | null | undefined {
   return entry.value;
 }
 
-function sweepExpiredDnsCache(limit: number) {
-  if (limit <= 0) {
-    return;
-  }
-  const now = Date.now();
-  let removed = 0;
-  for (const [key, entry] of dnsCache) {
-    if (entry.expiresAt <= now) {
-      dnsCache.delete(key);
-      removed += 1;
-      if (removed >= limit) {
-        break;
-      }
-    }
-  }
-}
-
 function setDnsCache(hostname: string, value: string | null) {
-  if (dnsCache.size >= DNS_CACHE_MAX_ENTRIES - 1) {
-    sweepExpiredDnsCache(DNS_CACHE_SWEEP_LIMIT);
-  }
   if (dnsCache.size >= DNS_CACHE_MAX_ENTRIES) {
     const oldestKey = dnsCache.keys().next().value;
     if (oldestKey) {
@@ -1488,33 +1410,28 @@ function createWebSocketReadableStream(
   };
 
   const enqueueChunk = (chunk: Uint8Array) => {
-    if (streamClosed) {
+    if (!controllerRef || streamClosed) {
       return;
     }
     if (queuedBytes + chunk.length > MAX_WS_QUEUE_BYTES) {
       logger.warn("WebSocket receive queue overflow, closing connection.");
       streamClosed = true;
-      if (controllerRef) {
-        controllerRef.error(new Error("WebSocket receive queue overflow"));
-      }
+      controllerRef.error(new Error("WebSocket receive queue overflow"));
       try { ws.close(); } catch (_) {}
       return;
     }
     queue.push(chunk);
     queuedBytes += chunk.length;
-    if (controllerRef) {
-      pump();
-      if (pullResolve && queue.length > 0) {
-        pullResolve();
-        pullResolve = null;
-      }
+    pump();
+    if (pullResolve && queue.length > 0) {
+      pullResolve();
+      pullResolve = null;
     }
   };
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
-      pump();
       ws.onmessage = (event) => {
         if (streamClosed) {
           return;
