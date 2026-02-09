@@ -17,7 +17,7 @@ export type AppConfig = {
   logLevel: LogLevel;
   stealthMode: boolean;
   masqueradeUrl: string;
-  dohUrl: string;
+  dohUrl: string | null;
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
   protocolCommands: ProtocolCommandConfig;
@@ -47,7 +47,7 @@ const STEALTH_LOG_LEVEL: LogLevel = "error";
 const DEFAULT_VERBOSE_LOG_LEVEL: LogLevel = "debug";
 const DEFAULT_STEALTH_MODE = true;
 const DEFAULT_MASQUERADE_URL = "https://dl.google.com/";
-const DEFAULT_DOH_URL = "https://ad.musicloud.io/dns-query";
+const DEFAULT_DOH_URL = "https://dns.quad9.net/dns-query";
 const DEFAULT_SHADOWSOCKS_METHOD = "chacha20-ietf-poly1305";
 const DEFAULT_SHADOWSOCKS_PASSWORD = "REPLACE_WITH_SHADOWSOCKS_PASSWORD";
 const DEFAULT_SHADOWSOCKS_PORT = 8388;
@@ -103,6 +103,21 @@ function validateDohUrl(value: string): string {
   return parsed.toString();
 }
 
+function resolveDohUrl(value: string | undefined): string | null {
+  if (value === undefined) {
+    return validateDohUrl(DEFAULT_DOH_URL);
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const normalized = trimmed.toLowerCase();
+  if (["off", "false", "disable", "disabled", "none"].includes(normalized)) {
+    return null;
+  }
+  return validateDohUrl(trimmed);
+}
+
 export async function loadConfig(): Promise<AppConfig> {
   const uuid = readEnv("UUID") ?? DEFAULT_UUID;
   const port = parsePort(readEnv("PORT"), DEFAULT_PORT);
@@ -116,7 +131,7 @@ export async function loadConfig(): Promise<AppConfig> {
   const masqueradeUrl = validateMasqueradeUrl(
     readEnv("MASQUERADE_URL") ?? DEFAULT_MASQUERADE_URL,
   );
-  const dohUrl = validateDohUrl(readEnv("DOH_URL") ?? DEFAULT_DOH_URL);
+  const dohUrl = resolveDohUrl(readEnv("DOH_URL"));
 
   const rawShadowsocksPassword = readEnv("SHADOWSOCKS_PASSWORD") ??
     DEFAULT_SHADOWSOCKS_PASSWORD;

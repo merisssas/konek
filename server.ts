@@ -10,7 +10,7 @@ export type VlessServerOptions = {
   port: number;
   uuid: string;
   masqueradeUrl: string;
-  dohUrl: string;
+  dohUrl: string | null;
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
   protocolCommands: ProtocolCommandConfig;
@@ -878,23 +878,25 @@ function isBlockedAddress(address: string): boolean {
 
 async function resolveTargetAddress(
   address: string,
-  dohUrl: string,
+  dohUrl: string | null,
   logger: Logger,
 ): Promise<string | null> {
   if (address.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(address)) {
     return address;
   }
-  try {
-    const records = await resolveDnsOverHttps(address, "A", dohUrl);
-    if (records.length > 0) {
-      return records[0];
+  if (dohUrl) {
+    try {
+      const records = await resolveDnsOverHttps(address, "A", dohUrl);
+      if (records.length > 0) {
+        return records[0];
+      }
+      const recordsV6 = await resolveDnsOverHttps(address, "AAAA", dohUrl);
+      if (recordsV6.length > 0) {
+        return recordsV6[0];
+      }
+    } catch (error) {
+      logger.warn(`DoH resolve failed for ${maskIP(address)}`, error);
     }
-    const recordsV6 = await resolveDnsOverHttps(address, "AAAA", dohUrl);
-    if (recordsV6.length > 0) {
-      return recordsV6[0];
-    }
-  } catch (error) {
-    logger.warn(`DoH resolve failed for ${maskIP(address)}`, error);
   }
   try {
     const fallbackRecords = await Deno.resolveDns(address, "A");
