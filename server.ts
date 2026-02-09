@@ -19,6 +19,8 @@ export type VlessServerOptions = {
 
 const textDecoder = new TextDecoder();
 const MEMORY_USAGE_LIMIT = 0.85;
+const MEMORY_USAGE_HYSTERESIS = 0.05;
+const MEMORY_USAGE_SAMPLE_INTERVAL_MS = 500;
 const TARPIT_CONFIG = {
   minDelayMs: 1000,
   maxDelayMs: 4000,
@@ -26,8 +28,13 @@ const TARPIT_CONFIG = {
   maxBytes: 300,
 };
 const MAX_WS_QUEUE_BYTES = 8 * 1024 * 1024;
+const MAX_WS_SEND_BUFFER_BYTES = 4 * 1024 * 1024;
+const WS_SEND_DRAIN_POLL_MS = 10;
+const WS_SEND_DRAIN_TIMEOUT_MS = 2000;
+const MAX_WS_PROTOCOL_TOKEN_LENGTH = 512;
 const UDP_IDLE_TIMEOUT_MS = 15_000;
 const UDP_IDLE_CHECK_INTERVAL_MS = 1_000;
+const VLESS_SUPPORTED_VERSION = 0x00;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -48,6 +55,20 @@ const FORWARDED_HEADER_PREFIXES = [
   "forwarded",
 ];
 
+type MemoryUsageCache = {
+  lastSampleTime: number;
+  lastUsageRatio: number;
+  emaUsageRatio: number;
+  overLimit: boolean;
+};
+
+const memoryUsageCache: MemoryUsageCache = {
+  lastSampleTime: 0,
+  lastUsageRatio: 0,
+  emaUsageRatio: 0,
+  overLimit: false,
+};
+
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -55,9 +76,17 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  */
 function uuidToBytes(uuid: string): Uint8Array {
   const hex = uuid.replace(/-/g, "");
+  if (hex.length !== 32) {
+    throw new Error("UUID hex length must be 32 characters");
+  }
   const bytes = new Uint8Array(16);
   for (let i = 0; i < 16; i++) {
-    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    const segment = hex.slice(i * 2, i * 2 + 2);
+    const parsed = Number.parseInt(segment, 16);
+    if (Number.isNaN(parsed)) {
+      throw new Error("UUID contains invalid hex characters");
+    }
+    bytes[i] = parsed;
   }
   return bytes;
 }
@@ -92,9 +121,14 @@ export function startVlessServer(options: VlessServerOptions): void {
       return handleHttpRequest(req, options, logger);
     }
 
-    const { earlyData, protocol } = parseWebSocketProtocolHeader(
+    const protocolResult = parseWebSocketProtocolHeader(
       req.headers.get("sec-websocket-protocol") || "",
     );
+    if (protocolResult.status === "invalid") {
+      logger.warn("Invalid sec-websocket-protocol header.");
+      return new Response("Bad Request", { status: 400 });
+    }
+    const { earlyData, protocol } = protocolResult;
     const { socket, response } = Deno.upgradeWebSocket(
       req,
       protocol ? { protocol } : undefined,
@@ -109,13 +143,31 @@ export function startVlessServer(options: VlessServerOptions): void {
 }
 
 function isMemoryPressure(limit: number): boolean {
-  const info = Deno.systemMemoryInfo();
-  if (info.total <= 0) {
-    return false;
+  const now = Date.now();
+  if (now - memoryUsageCache.lastSampleTime >= MEMORY_USAGE_SAMPLE_INTERVAL_MS) {
+    const info = Deno.systemMemoryInfo();
+    if (info.total > 0) {
+      const available = info.available > 0 ? info.available : info.free;
+      const usageRatio = (info.total - available) / info.total;
+      const alpha = 0.3;
+      memoryUsageCache.lastUsageRatio = usageRatio;
+      memoryUsageCache.emaUsageRatio =
+        memoryUsageCache.emaUsageRatio === 0
+          ? usageRatio
+          : alpha * usageRatio + (1 - alpha) * memoryUsageCache.emaUsageRatio;
+    }
+    memoryUsageCache.lastSampleTime = now;
   }
-  const available = info.available > 0 ? info.available : info.free;
-  const usageRatio = (info.total - available) / info.total;
-  return usageRatio >= limit;
+  const usageRatio =
+    memoryUsageCache.emaUsageRatio || memoryUsageCache.lastUsageRatio;
+  if (memoryUsageCache.overLimit) {
+    if (usageRatio < limit - MEMORY_USAGE_HYSTERESIS) {
+      memoryUsageCache.overLimit = false;
+    }
+  } else if (usageRatio >= limit) {
+    memoryUsageCache.overLimit = true;
+  }
+  return memoryUsageCache.overLimit;
 }
 
 async function handleHttpRequest(
@@ -316,23 +368,7 @@ async function handleTcpPipe(
     return;
   }
 
-  const wsWritable = new WritableStream<Uint8Array>({
-    write(chunk) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(chunk);
-      }
-    },
-    close() {
-      try {
-        ws.close();
-      } catch (_) {}
-    },
-    abort() {
-      try {
-        ws.close();
-      } catch (_) {}
-    },
-  });
+  const wsWritable = createWebSocketWritableStream(ws, logger);
 
   try {
     await Promise.all([
@@ -358,7 +394,6 @@ async function handleUdpPipe(
   const udpConn = Deno.listenDatagram({
     port: 0,
     transport: "udp",
-    hostname: "0.0.0.0",
   });
   let closed = false;
   let lastActivity = Date.now();
@@ -389,12 +424,26 @@ async function handleUdpPipe(
 
   const wsToUdp = async () => {
     const reader = inputStream.getReader();
+    let buffer = new Uint8Array(0);
     try {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
         markActivity();
-        await udpConn.send(value, { transport: "udp", hostname: address, port });
+        buffer = appendBuffer(buffer, value);
+        while (buffer.length >= 2) {
+          const length = (buffer[0] << 8) | buffer[1];
+          if (buffer.length < length + 2) {
+            break;
+          }
+          const payload = buffer.subarray(2, 2 + length);
+          buffer = buffer.subarray(2 + length);
+          await udpConn.send(payload, {
+            transport: "udp",
+            hostname: address,
+            port,
+          });
+        }
       }
     } catch (error) {
       logger.warn("UDP send failed", error);
@@ -408,7 +457,11 @@ async function handleUdpPipe(
       for await (const [data] of udpConn) {
         markActivity();
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data);
+          try {
+            ws.send(encodeUdpFrame(data));
+          } catch (_) {
+            break;
+          }
         } else {
           break;
         }
@@ -433,10 +486,12 @@ function createCombinedStream(
   if (head.length === 0) {
     return bodyStream;
   }
+  let cancelled = false;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   return new ReadableStream<Uint8Array>({
     async start(controller) {
+      reader = bodyStream.getReader();
       controller.enqueue(head);
-      const reader = bodyStream.getReader();
       try {
         while (true) {
           const { value, done } = await reader.read();
@@ -445,8 +500,23 @@ function createCombinedStream(
         }
         controller.close();
       } catch (error) {
-        controller.error(error);
+        if (!cancelled) {
+          controller.error(error);
+        }
+      } finally {
+        reader.releaseLock();
+        reader = null;
       }
+    },
+    cancel() {
+      cancelled = true;
+      try {
+        reader?.cancel();
+      } catch (_) {}
+      try {
+        reader?.releaseLock();
+      } catch (_) {}
+      reader = null;
     },
   });
 }
@@ -476,21 +546,27 @@ async function tarpitAndClose(ws: WebSocket) {
 
 function parseWebSocketProtocolHeader(
   headerValue: string,
-): { earlyData?: ArrayBuffer; protocol?: string } {
+): { earlyData?: ArrayBuffer; protocol?: string; status: "ok" | "invalid" } {
   const tokens = headerValue
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
   for (const token of tokens) {
+    if (token.length > MAX_WS_PROTOCOL_TOKEN_LENGTH) {
+      return { status: "invalid" };
+    }
+    if (!isBase64UrlToken(token)) {
+      return { status: "invalid" };
+    }
     const { earlyData } = base64ToArrayBuffer(token);
     if (earlyData) {
-      return { earlyData, protocol: token };
+      return { earlyData, protocol: token, status: "ok" };
     }
   }
   if (tokens.length > 0) {
-    return { protocol: tokens[0] };
+    return { protocol: tokens[0], status: "ok" };
   }
-  return {};
+  return { status: "ok" };
 }
 
 function base64ToArrayBuffer(base64Str: string): { earlyData?: ArrayBuffer } {
@@ -499,12 +575,25 @@ function base64ToArrayBuffer(base64Str: string): { earlyData?: ArrayBuffer } {
   }
   try {
     const normalized = base64Str.replace(/-/g, "+").replace(/_/g, "/");
-    const decoded = atob(normalized);
+    const padding = normalized.length % 4 === 0
+      ? ""
+      : "=".repeat(4 - (normalized.length % 4));
+    const decoded = atob(`${normalized}${padding}`);
     const bytes = Uint8Array.from(decoded, (char) => char.charCodeAt(0));
     return { earlyData: bytes.buffer };
   } catch (_) {
     return {};
   }
+}
+
+function isBase64UrlToken(token: string): boolean {
+  if (!/^[A-Za-z0-9\-_]+$/.test(token)) {
+    return false;
+  }
+  if (token.length % 4 === 1) {
+    return false;
+  }
+  return true;
 }
 
 function getVLESSConfig(
@@ -657,6 +746,7 @@ function parseCommand(command: string): string[] {
   let inSingleQuote = false;
   let inDoubleQuote = false;
   let escapeNext = false;
+  let invalid = false;
 
   for (const char of command) {
     if (escapeNext) {
@@ -685,10 +775,13 @@ function parseCommand(command: string): string[] {
     }
     current += char;
   }
+  if (escapeNext || inSingleQuote || inDoubleQuote) {
+    invalid = true;
+  }
   if (current) {
     parts.push(current);
   }
-  return parts;
+  return invalid ? [] : parts;
 }
 
 function startTcpProtocolListener(
@@ -778,15 +871,22 @@ function parseVlessHeader(
     return { status: "need_more" };
   }
 
+  const version = buffer[0];
+  if (version !== VLESS_SUPPORTED_VERSION) {
+    logger.warn(`Unsupported VLESS version: ${version}`);
+    return { status: "invalid" };
+  }
+
   const clientUUID = buffer.subarray(1, 17);
-  for (let i = 0; i < 16; i++) {
-    if (clientUUID[i] !== validUUIDBytes[i]) {
-      logger.error("UUID mismatch");
-      return { status: "invalid" };
-    }
+  if (!constantTimeEqual(clientUUID, validUUIDBytes)) {
+    logger.error("UUID mismatch");
+    return { status: "invalid" };
   }
 
   const addonsLen = buffer[17];
+  if (addonsLen > 0 && buffer.length < 18 + addonsLen) {
+    return { status: "need_more" };
+  }
   const commandIndex = 18 + addonsLen;
   if (buffer.length <= commandIndex) {
     return { status: "need_more" };
@@ -856,6 +956,17 @@ function parseVlessHeader(
   };
 }
 
+function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+
 function isBlockedAddress(address: string): boolean {
   if (address === "localhost") {
     return true;
@@ -884,13 +995,17 @@ async function resolveTargetAddress(
   }
   try {
     const records = await Deno.resolveDns(address, "A");
-    if (records.length > 0) {
-      return records[0];
-    }
     const recordsV6 = await Deno.resolveDns(address, "AAAA");
-    if (recordsV6.length > 0) {
-      return recordsV6[0];
+    const all = [...records, ...recordsV6];
+    if (all.length === 0) {
+      return null;
     }
+    if (all.some((record) => isBlockedAddress(record))) {
+      logger.warn(`DNS resolution returned blocked address for ${address}`);
+      return null;
+    }
+    const publicRecord = all.find((record) => !isBlockedAddress(record));
+    return publicRecord ?? null;
   } catch (error) {
     logger.warn(`DNS resolve failed for ${address}`, error);
   }
@@ -918,6 +1033,10 @@ function isPrivateIpv4(address: string): boolean {
 
 function isPrivateIpv6(address: string): boolean {
   const normalized = address.toLowerCase();
+  if (normalized.startsWith("::ffff:")) {
+    const ipv4 = normalized.replace("::ffff:", "");
+    return isPrivateIpv4(ipv4) || ipv4 === "127.0.0.1";
+  }
   return normalized.startsWith("fc") ||
     normalized.startsWith("fd") ||
     normalized.startsWith("fe80") ||
@@ -1020,6 +1139,60 @@ function createWebSocketReadableStream(
       ws.close();
     },
   });
+}
+
+function createWebSocketWritableStream(
+  ws: WebSocket,
+  logger: Logger,
+): WritableStream<Uint8Array> {
+  return new WritableStream<Uint8Array>({
+    async write(chunk) {
+      if (ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      if (ws.bufferedAmount + chunk.length > MAX_WS_SEND_BUFFER_BYTES) {
+        logger.warn("WebSocket send buffer overflow, closing connection.");
+        try {
+          ws.close();
+        } catch (_) {}
+        return;
+      }
+      ws.send(chunk);
+      const start = Date.now();
+      while (
+        ws.readyState === WebSocket.OPEN &&
+        ws.bufferedAmount > MAX_WS_SEND_BUFFER_BYTES / 2
+      ) {
+        if (Date.now() - start > WS_SEND_DRAIN_TIMEOUT_MS) {
+          logger.warn("WebSocket send buffer drain timeout, closing connection.");
+          try {
+            ws.close();
+          } catch (_) {}
+          return;
+        }
+        await delay(WS_SEND_DRAIN_POLL_MS);
+      }
+    },
+    close() {
+      try {
+        ws.close();
+      } catch (_) {}
+    },
+    abort() {
+      try {
+        ws.close();
+      } catch (_) {}
+    },
+  });
+}
+
+function encodeUdpFrame(payload: Uint8Array): Uint8Array {
+  const length = payload.length;
+  const framed = new Uint8Array(2 + length);
+  framed[0] = (length >> 8) & 0xff;
+  framed[1] = length & 0xff;
+  framed.set(payload, 2);
+  return framed;
 }
 
 function filterRequestHeaders(headers: Headers): Headers {
