@@ -525,7 +525,9 @@ async function handleTcpPipe(
     if (closed) return;
     closed = true;
     try {
-      inputStream.cancel("tcp closed");
+      if (!inputStream.locked) {
+        inputStream.cancel("tcp closed");
+      }
     } catch (_) {}
     try {
       remoteConn.close();
@@ -621,7 +623,9 @@ async function handleUdpPipe(
     }
     closed = true;
     try {
-      inputStream.cancel("udp closed");
+      if (!inputStream.locked) {
+        inputStream.cancel("udp closed");
+      }
     } catch (_) {}
     try {
       udpConn.close();
