@@ -81,6 +81,18 @@ const FORWARDED_HEADER_PREFIXES = [
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const safeCancelReadableStream = (
+  stream: ReadableStream<Uint8Array>,
+  reason: string,
+) => {
+  if (stream.locked) {
+    return;
+  }
+  try {
+    stream.cancel(reason).catch(() => {});
+  } catch (_) {}
+};
+
 type DnsCacheEntry = {
   value: string | null;
   expiresAt: number;
@@ -549,9 +561,7 @@ async function handleTcpPipe(
   const closeAll = () => {
     if (closed) return;
     closed = true;
-    try {
-      inputStream.cancel("tcp closed");
-    } catch (_) {}
+    safeCancelReadableStream(inputStream, "tcp closed");
     try {
       remoteConn.close();
     } catch (_) {}
@@ -645,9 +655,7 @@ async function handleUdpPipe(
       return;
     }
     closed = true;
-    try {
-      inputStream.cancel("udp closed");
-    } catch (_) {}
+    safeCancelReadableStream(inputStream, "udp closed");
     try {
       udpConn.close();
     } catch (_) {}
