@@ -1,4 +1,4 @@
-import type { Logger } from "./logger.ts";
+import type { ErrorLogBuffer, Logger } from "./logger.ts";
 import type {
   ShadowsocksConfig,
   TrojanConfig,
@@ -13,7 +13,7 @@ export type VlessServerOptions = {
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
   protocolCommands: ProtocolCommandConfig;
-  errorLogBuffer: string[];
+  errorLogBuffer: ErrorLogBuffer;
   logger?: Logger;
 };
 
@@ -707,11 +707,12 @@ function startTcpProtocolListener(
   });
 }
 
-function formatErrorLogs(errorLogBuffer: string[]): string {
-  if (errorLogBuffer.length === 0) {
+function formatErrorLogs(errorLogBuffer: ErrorLogBuffer): string {
+  const errors = errorLogBuffer.getRecentErrors();
+  if (errors.length === 0) {
     return "No errors recorded.";
   }
-  return errorLogBuffer.join("\n");
+  return errors.join("\n");
 }
 
 function formatServerInfo(options: VlessServerOptions): string {
@@ -741,7 +742,7 @@ function formatServerInfo(options: VlessServerOptions): string {
       protocolCommands: options.protocolCommands,
     },
     errors: {
-      count: options.errorLogBuffer.length,
+      count: options.errorLogBuffer.size(),
     },
   };
   return JSON.stringify(info, null, 2);

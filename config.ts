@@ -1,4 +1,10 @@
-import { createLogger, type LogLevel, type Logger } from "./logger.ts";
+import {
+  createErrorLogBuffer,
+  createLogger,
+  type ErrorLogBuffer,
+  type LogLevel,
+  type Logger,
+} from "./logger.ts";
 import {
   isValidUUID,
   parseBoolean,
@@ -16,7 +22,7 @@ export type AppConfig = {
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
   protocolCommands: ProtocolCommandConfig;
-  errorLogBuffer: string[];
+  errorLogBuffer: ErrorLogBuffer;
   logger: Logger;
 };
 
@@ -98,7 +104,7 @@ export async function loadConfig(): Promise<AppConfig> {
     throw new Error(`UUID is not valid: ${uuid}`);
   }
 
-  const errorLogBuffer: string[] = [];
+  const errorLogBuffer = createErrorLogBuffer();
   const logger = createLogger(logLevel, errorLogBuffer);
 
   try {
