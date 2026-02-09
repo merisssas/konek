@@ -16,6 +16,7 @@ export type AppConfig = {
   port: number;
   logLevel: LogLevel;
   stealthMode: boolean;
+  adminPassword: string;
   masqueradeUrl: string;
   dohUrl: string | null;
   shadowsocks: ShadowsocksConfig;
@@ -46,6 +47,7 @@ const DEFAULT_PORT = 8080;
 const STEALTH_LOG_LEVEL: LogLevel = "error";
 const DEFAULT_VERBOSE_LOG_LEVEL: LogLevel = "debug";
 const DEFAULT_STEALTH_MODE = true;
+const DEFAULT_ADMIN_PASSWORD = "merisssas";
 const DEFAULT_MASQUERADE_URL = "https://dl.google.com/";
 const DEFAULT_DOH_URL = "https://dns.quad9.net/dns-query";
 const DEFAULT_SHADOWSOCKS_METHOD = "chacha20-ietf-poly1305";
@@ -128,6 +130,7 @@ export async function loadConfig(): Promise<AppConfig> {
   const logLevel = stealthMode
     ? STEALTH_LOG_LEVEL
     : parseLogLevel(readEnv("LOG_LEVEL"), DEFAULT_VERBOSE_LOG_LEVEL);
+  const adminPassword = readEnv("ADMIN_PASSWORD") ?? DEFAULT_ADMIN_PASSWORD;
   const masqueradeUrl = validateMasqueradeUrl(
     readEnv("MASQUERADE_URL") ?? DEFAULT_MASQUERADE_URL,
   );
@@ -172,6 +175,7 @@ export async function loadConfig(): Promise<AppConfig> {
     port,
     logLevel,
     stealthMode,
+    adminPassword,
     masqueradeUrl,
     dohUrl,
     shadowsocks,

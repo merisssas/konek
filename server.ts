@@ -9,6 +9,7 @@ import { maskIP, uuidToBytes } from "./utils.ts";
 export type VlessServerOptions = {
   port: number;
   uuid: string;
+  adminPassword: string;
   masqueradeUrl: string;
   dohUrl: string | null;
   shadowsocks: ShadowsocksConfig;
@@ -20,6 +21,9 @@ export type VlessServerOptions = {
 
 const textDecoder = new TextDecoder();
 const MEMORY_USAGE_LIMIT = 0.85;
+const HANDSHAKE_TIMEOUT_MS = 5000;
+const TCP_IDLE_TIMEOUT_MS = 30_000;
+const TCP_IDLE_CHECK_INTERVAL_MS = 5_000;
 const TARPIT_CONFIG = {
   minDelayMs: 1000,
   maxDelayMs: 4000,
@@ -27,8 +31,29 @@ const TARPIT_CONFIG = {
   maxBytes: 300,
 };
 const MAX_WS_QUEUE_BYTES = 8 * 1024 * 1024;
+const MAX_EARLY_DATA_BYTES = 64 * 1024;
+const MAX_CONCURRENT_SESSIONS = 1000;
+const SESSION_HIGH_WATER_MARK = Math.floor(MAX_CONCURRENT_SESSIONS * 0.9);
+const MAX_UDP_DATAGRAM_SIZE = 1400;
+const UDP_MAX_PACKETS_PER_SECOND = 200;
+const UDP_BURST_PACKETS = 400;
 const UDP_IDLE_TIMEOUT_MS = 15_000;
 const UDP_IDLE_CHECK_INTERVAL_MS = 1_000;
+const DNS_CACHE_TTL_MS = 60_000;
+const DNS_CACHE_MAX_ENTRIES = 500;
+const DNS_MAX_RESOLVES_PER_SESSION = 4;
+const DOH_TIMEOUT_MS = 1500;
+const PROXY_MAX_BODY_BYTES = 1024 * 1024;
+
+const ALLOWED_MASQUERADE_METHODS = new Set(["GET", "HEAD", "POST"]);
+const REDACTED_REQUEST_HEADERS = new Set([
+  "origin",
+  "referer",
+  "sec-fetch-site",
+  "sec-fetch-mode",
+  "sec-fetch-dest",
+  "sec-fetch-user",
+]);
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -51,12 +76,49 @@ const FORWARDED_HEADER_PREFIXES = [
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+type DnsCacheEntry = {
+  value: string | null;
+  expiresAt: number;
+};
+
+type SessionState = {
+  resolveCount: number;
+};
+
+type SessionLimiter = {
+  tryAcquire: () => (() => void) | null;
+  active: () => number;
+};
+
+const dnsCache = new Map<string, DnsCacheEntry>();
+
+type LoadAdvisor = {
+  isHighLoad: () => boolean;
+};
+
+function createSessionLimiter(maxSessions: number): SessionLimiter {
+  let activeSessions = 0;
+  return {
+    tryAcquire: () => {
+      if (activeSessions >= maxSessions) {
+        return null;
+      }
+      activeSessions += 1;
+      return () => {
+        activeSessions = Math.max(0, activeSessions - 1);
+      };
+    },
+    active: () => activeSessions,
+  };
+}
+
 export function startVlessServer(options: VlessServerOptions): void {
   const validUUIDBytes = uuidToBytes(options.uuid);
   if (!validUUIDBytes) {
     throw new Error("UUID is not valid");
   }
   const logger = options.logger ?? console;
+  const sessionLimiter = createSessionLimiter(MAX_CONCURRENT_SESSIONS);
   logger.info(`🚀 VLESS server listening on :${options.port} [UDP: ON]`);
   startTcpProtocolService(
     "shadowsocks",
@@ -84,6 +146,13 @@ export function startVlessServer(options: VlessServerOptions): void {
     const { earlyData, protocol } = parseWebSocketProtocolHeader(
       req.headers.get("sec-websocket-protocol") || "",
     );
+    if (earlyData && earlyData.byteLength > MAX_EARLY_DATA_BYTES) {
+      return new Response("Payload Too Large", { status: 413 });
+    }
+    const releaseSession = sessionLimiter.tryAcquire();
+    if (!releaseSession) {
+      return new Response("Service Unavailable", { status: 503 });
+    }
     const { socket, response } = Deno.upgradeWebSocket(
       req,
       protocol ? { protocol } : undefined,
@@ -96,14 +165,30 @@ export function startVlessServer(options: VlessServerOptions): void {
         earlyData,
         options.dohUrl,
         logger,
+        {
+          isHighLoad: () =>
+            sessionLimiter.active() >= SESSION_HIGH_WATER_MARK ||
+            isMemoryPressure(MEMORY_USAGE_LIMIT),
+        },
       );
     };
+    socket.addEventListener("close", () => {
+      releaseSession();
+    }, { once: true });
+    socket.addEventListener("error", () => {
+      releaseSession();
+    }, { once: true });
 
     return response;
   });
 }
 
 function isMemoryPressure(limit: number): boolean {
+  const cgroup = readCgroupMemoryInfo();
+  if (cgroup && cgroup.max > 0) {
+    const usageRatio = cgroup.current / cgroup.max;
+    return usageRatio >= limit;
+  }
   const info = Deno.systemMemoryInfo();
   if (info.total <= 0) {
     return false;
@@ -111,6 +196,48 @@ function isMemoryPressure(limit: number): boolean {
   const available = info.available > 0 ? info.available : info.free;
   const usageRatio = (info.total - available) / info.total;
   return usageRatio >= limit;
+}
+
+function readCgroupMemoryInfo():
+  | { current: number; max: number }
+  | null {
+  const v2Current = readNumberFromFile("/sys/fs/cgroup/memory.current");
+  const v2Max = readNumberFromFile("/sys/fs/cgroup/memory.max", true);
+  if (v2Current !== null && v2Max !== null && v2Max > 0) {
+    return { current: v2Current, max: v2Max };
+  }
+  const v1Current = readNumberFromFile(
+    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+  );
+  const v1Max = readNumberFromFile(
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+  );
+  if (v1Current !== null && v1Max !== null && v1Max > 0) {
+    return { current: v1Current, max: v1Max };
+  }
+  return null;
+}
+
+function readNumberFromFile(
+  path: string,
+  allowMaxToken = false,
+): number | null {
+  try {
+    const raw = Deno.readTextFileSync(path).trim();
+    if (!raw) {
+      return null;
+    }
+    if (allowMaxToken && raw === "max") {
+      return Number.MAX_SAFE_INTEGER;
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value)) {
+      return null;
+    }
+    return value;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function handleHttpRequest(
@@ -123,6 +250,10 @@ async function handleHttpRequest(
     return Response.redirect(options.masqueradeUrl, 302);
   }
   if (url.pathname === "/error") {
+    const password = url.searchParams.get("password");
+    if (password !== options.adminPassword) {
+      return new Response("Unauthorized", { status: 401 });
+    }
     return new Response(formatErrorLogs(options.errorLogBuffer), {
       status: 200,
       headers: { "Content-Type": "text/plain;charset=utf-8" },
@@ -130,7 +261,7 @@ async function handleHttpRequest(
   }
   if (url.pathname === "/info") {
     const password = url.searchParams.get("password");
-    if (password !== "merisssas") {
+    if (password !== options.adminPassword) {
       return new Response("Unauthorized", { status: 401 });
     }
     return new Response(formatServerInfo(options), {
@@ -140,7 +271,7 @@ async function handleHttpRequest(
   }
   if (url.pathname === "/config") {
     const password = url.searchParams.get("password");
-    if (password !== "merisssas") {
+    if (password !== options.adminPassword) {
       return new Response("Unauthorized", { status: 401 });
     }
     const port = url.port || (url.protocol === "https:" ? "443" : "80");
@@ -178,6 +309,10 @@ async function proxyMasquerade(
   masqueradeUrl: string,
   logger: Logger,
 ): Promise<Response> {
+  const method = req.method.toUpperCase();
+  if (!ALLOWED_MASQUERADE_METHODS.has(method)) {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
   const incomingUrl = new URL(req.url);
   const targetUrl = new URL(masqueradeUrl);
   targetUrl.pathname = incomingUrl.pathname;
@@ -185,11 +320,18 @@ async function proxyMasquerade(
 
   const headers = filterRequestHeaders(req.headers);
   headers.set("host", targetUrl.host);
+  const contentLength = req.headers.get("content-length");
+  if (contentLength && Number(contentLength) > PROXY_MAX_BODY_BYTES) {
+    return new Response("Payload Too Large", { status: 413 });
+  }
+  const body = req.body
+    ? limitRequestBody(req.body, PROXY_MAX_BODY_BYTES)
+    : undefined;
 
   const outboundRequest = new Request(targetUrl.toString(), {
-    method: req.method,
+    method,
     headers,
-    body: req.body,
+    body,
     redirect: "follow",
   });
 
@@ -201,6 +343,9 @@ async function proxyMasquerade(
       headers: filterResponseHeaders(response.headers),
     });
   } catch (error) {
+    if (error instanceof Error && error.message === "Request body too large") {
+      return new Response("Payload Too Large", { status: 413 });
+    }
     logger.error("Masquerade proxy failed", error);
     return new Response("Service Unavailable", { status: 503 });
   }
@@ -212,9 +357,20 @@ async function processVlessSession(
   earlyData: ArrayBuffer | undefined,
   dohUrl: string | null,
   logger: Logger,
+  loadAdvisor: LoadAdvisor,
 ) {
   let vlessHeaderProcessed = false;
   let handshakeBuffer = new Uint8Array(0);
+  const sessionState: SessionState = { resolveCount: 0 };
+
+  const handshakeTimer = setTimeout(() => {
+    if (!vlessHeaderProcessed) {
+      logger.warn("VLESS handshake timeout.");
+      try {
+        ws.close();
+      } catch (_) {}
+    }
+  }, HANDSHAKE_TIMEOUT_MS);
 
   const wsStream = createWebSocketReadableStream(ws, earlyData, logger);
   const wsReader = wsStream.getReader();
@@ -232,7 +388,7 @@ async function processVlessSession(
           continue;
         }
         if (parsed.status === "invalid") {
-          await tarpitAndClose(ws);
+          await tarpitAndClose(ws, loadAdvisor);
           return;
         }
 
@@ -240,13 +396,10 @@ async function processVlessSession(
           parsed.address,
           dohUrl,
           logger,
+          sessionState,
         );
         if (!resolvedTarget || isBlockedAddress(resolvedTarget)) {
-          const maskedAddress = maskIP(parsed.address);
-          const maskedTarget = resolvedTarget ? maskIP(resolvedTarget) : "null";
-          logger.warn(
-            `Blocked or unresolved target: ${maskedAddress} -> ${maskedTarget}`,
-          );
+          logger.warn("Blocked or unresolved target request.");
           ws.close();
           return;
         }
@@ -260,6 +413,7 @@ async function processVlessSession(
         }
 
         vlessHeaderProcessed = true;
+        clearTimeout(handshakeTimer);
         const payload = handshakeBuffer.subarray(parsed.payloadOffset);
         handshakeBuffer = new Uint8Array(0);
 
@@ -291,7 +445,38 @@ async function processVlessSession(
     try {
       ws.close();
     } catch (_) {}
+  } finally {
+    clearTimeout(handshakeTimer);
   }
+}
+
+function activityTransform(onActivity: () => void) {
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      onActivity();
+      controller.enqueue(chunk);
+    },
+  });
+}
+
+function createTokenBucket(ratePerSecond: number, burst: number) {
+  let tokens = burst;
+  let lastRefill = Date.now();
+  return {
+    consume(amount: number) {
+      const now = Date.now();
+      const elapsed = (now - lastRefill) / 1000;
+      if (elapsed > 0) {
+        tokens = Math.min(burst, tokens + elapsed * ratePerSecond);
+        lastRefill = now;
+      }
+      if (tokens < amount) {
+        return false;
+      }
+      tokens -= amount;
+      return true;
+    },
+  };
 }
 
 async function handleTcpPipe(
@@ -302,6 +487,7 @@ async function handleTcpPipe(
   logger: Logger,
 ) {
   let remoteConn: Deno.TcpConn;
+  let closed = false;
   try {
     remoteConn = await Deno.connect({ hostname: address, port });
     try {
@@ -318,9 +504,32 @@ async function handleTcpPipe(
     return;
   }
 
+  const closeAll = () => {
+    if (closed) return;
+    closed = true;
+    try {
+      remoteConn.close();
+    } catch (_) {}
+    try {
+      ws.close();
+    } catch (_) {}
+  };
+
+  let lastActivity = Date.now();
+  const markActivity = () => {
+    lastActivity = Date.now();
+  };
+  const idleChecker = setInterval(() => {
+    if (Date.now() - lastActivity > TCP_IDLE_TIMEOUT_MS) {
+      logger.info("TCP idle timeout reached, closing connection.");
+      closeAll();
+    }
+  }, TCP_IDLE_CHECK_INTERVAL_MS);
+
   const wsWritable = new WritableStream<Uint8Array>({
     write(chunk) {
       if (ws.readyState === WebSocket.OPEN) {
+        markActivity();
         ws.send(chunk);
       }
     },
@@ -337,16 +546,21 @@ async function handleTcpPipe(
   });
 
   try {
-    await Promise.all([
-      remoteConn.readable.pipeTo(wsWritable).catch(() => {}),
-      inputStream.pipeTo(remoteConn.writable).catch(() => {}),
-    ]);
-  } catch (_) {
-    // ignore pipe errors
+    const remoteToWs = remoteConn.readable
+      .pipeThrough(activityTransform(markActivity))
+      .pipeTo(wsWritable)
+      .catch(() => {});
+    const wsToRemote = inputStream
+      .pipeThrough(activityTransform(markActivity))
+      .pipeTo(remoteConn.writable)
+      .catch(() => {});
+
+    await Promise.race([remoteToWs, wsToRemote]);
+    closeAll();
+    await Promise.all([remoteToWs, wsToRemote]).catch(() => {});
   } finally {
-    try {
-      remoteConn.close();
-    } catch (_) {}
+    clearInterval(idleChecker);
+    closeAll();
   }
 }
 
@@ -364,6 +578,14 @@ async function handleUdpPipe(
   });
   let closed = false;
   let lastActivity = Date.now();
+  const outboundLimiter = createTokenBucket(
+    UDP_MAX_PACKETS_PER_SECOND,
+    UDP_BURST_PACKETS,
+  );
+  const inboundLimiter = createTokenBucket(
+    UDP_MAX_PACKETS_PER_SECOND,
+    UDP_BURST_PACKETS,
+  );
 
   const closeAll = () => {
     if (closed) {
@@ -390,16 +612,64 @@ async function handleUdpPipe(
   }, UDP_IDLE_CHECK_INTERVAL_MS);
 
   const wsToUdp = async () => {
-    const udpWriter = new WritableStream<Uint8Array>({
-      async write(chunk) {
-        markActivity();
-        await udpConn.send(chunk, { transport: "udp", hostname: address, port });
-      },
-    });
+    const reader = inputStream.getReader();
+    let buffer = new Uint8Array(0);
+    let dropRemaining = 0;
     try {
-      await inputStream.pipeTo(udpWriter);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (!value) {
+          continue;
+        }
+        markActivity();
+        buffer = appendBuffer(buffer, value);
+        while (buffer.length >= 2) {
+          if (dropRemaining > 0) {
+            const dropSize = Math.min(dropRemaining, buffer.length);
+            buffer = buffer.subarray(dropSize);
+            dropRemaining -= dropSize;
+            if (buffer.length < 2) {
+              break;
+            }
+            continue;
+          }
+          const size = (buffer[0] << 8) | buffer[1];
+          if (size === 0) {
+            buffer = buffer.subarray(2);
+            continue;
+          }
+          if (size > MAX_UDP_DATAGRAM_SIZE) {
+            buffer = buffer.subarray(2);
+            if (buffer.length >= size) {
+              buffer = buffer.subarray(size);
+            } else {
+              dropRemaining = size - buffer.length;
+              buffer = new Uint8Array(0);
+            }
+            continue;
+          }
+          if (buffer.length < 2 + size) {
+            break;
+          }
+          const payload = buffer.subarray(2, 2 + size);
+          buffer = buffer.subarray(2 + size);
+          if (!outboundLimiter.consume(1)) {
+            continue;
+          }
+          await udpConn.send(payload, {
+            transport: "udp",
+            hostname: address,
+            port,
+          });
+        }
+      }
     } catch (error) {
       logger.warn("UDP send failed", error);
+    } finally {
+      reader.releaseLock();
     }
   };
 
@@ -407,8 +677,18 @@ async function handleUdpPipe(
     try {
       for await (const [data] of udpConn) {
         markActivity();
+        if (data.length > MAX_UDP_DATAGRAM_SIZE) {
+          continue;
+        }
+        if (!inboundLimiter.consume(1)) {
+          continue;
+        }
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data);
+          const framed = new Uint8Array(2 + data.length);
+          framed[0] = (data.length >> 8) & 0xff;
+          framed[1] = data.length & 0xff;
+          framed.set(data, 2);
+          ws.send(framed);
         } else {
           break;
         }
@@ -433,32 +713,39 @@ function createCombinedStream(
   if (head.length === 0) {
     return bodyStream;
   }
+  const bodyReader = bodyStream.getReader();
+  let headSent = false;
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      controller.enqueue(head);
-      try {
-        await bodyStream.pipeTo(
-          new WritableStream<Uint8Array>({
-            write(chunk) {
-              controller.enqueue(chunk);
-            },
-            close() {
-              controller.close();
-            },
-            abort(error) {
-              controller.error(error);
-            },
-          }),
-        );
-      } catch (error) {
-        controller.error(error);
+    async pull(controller) {
+      if (!headSent) {
+        controller.enqueue(head);
+        headSent = true;
+        return;
       }
+      const { value, done } = await bodyReader.read();
+      if (done) {
+        controller.close();
+        bodyReader.releaseLock();
+        return;
+      }
+      if (value) {
+        controller.enqueue(value);
+      }
+    },
+    cancel(reason) {
+      bodyReader.cancel(reason).catch(() => {});
     },
   });
 }
 
-async function tarpitAndClose(ws: WebSocket) {
+async function tarpitAndClose(ws: WebSocket, loadAdvisor: LoadAdvisor) {
   if (ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  if (loadAdvisor.isHighLoad()) {
+    try {
+      ws.close();
+    } catch (_) {}
     return;
   }
   const garbageSize = Math.floor(
@@ -789,7 +1076,7 @@ function parseVlessHeader(
   const clientUUID = buffer.subarray(1, 17);
   for (let i = 0; i < 16; i++) {
     if (clientUUID[i] !== validUUIDBytes[i]) {
-      logger.error("UUID mismatch");
+      logger.debug("UUID mismatch");
       return { status: "invalid" };
     }
   }
@@ -851,7 +1138,7 @@ function parseVlessHeader(
     for (let i = 0; i < 8; i++) parts.push(view.getUint16(i * 2).toString(16));
     address = parts.join(":");
   } else {
-    logger.error(`Unknown address type: ${addrType}`);
+    logger.debug(`Unknown address type: ${addrType}`);
     return { status: "invalid" };
   }
 
@@ -887,18 +1174,40 @@ async function resolveTargetAddress(
   address: string,
   dohUrl: string | null,
   logger: Logger,
+  sessionState: SessionState,
 ): Promise<string | null> {
   if (address.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(address)) {
     return address;
   }
+  if (sessionState.resolveCount >= DNS_MAX_RESOLVES_PER_SESSION) {
+    logger.warn("DNS resolve limit exceeded for session.");
+    return null;
+  }
+  sessionState.resolveCount += 1;
+  const cached = getDnsCache(address);
+  if (cached !== undefined) {
+    return cached;
+  }
   if (dohUrl) {
     try {
-      const records = await resolveDnsOverHttps(address, "A", dohUrl);
+      const records = await resolveDnsOverHttps(
+        address,
+        "A",
+        dohUrl,
+        DOH_TIMEOUT_MS,
+      );
       if (records.length > 0) {
+        setDnsCache(address, records[0]);
         return records[0];
       }
-      const recordsV6 = await resolveDnsOverHttps(address, "AAAA", dohUrl);
+      const recordsV6 = await resolveDnsOverHttps(
+        address,
+        "AAAA",
+        dohUrl,
+        DOH_TIMEOUT_MS,
+      );
       if (recordsV6.length > 0) {
+        setDnsCache(address, recordsV6[0]);
         return recordsV6[0];
       }
     } catch (error) {
@@ -906,17 +1215,26 @@ async function resolveTargetAddress(
     }
   }
   try {
-    const fallbackRecords = await Deno.resolveDns(address, "A");
+    const fallbackRecords = await withTimeout(
+      Deno.resolveDns(address, "A"),
+      DOH_TIMEOUT_MS,
+    );
     if (fallbackRecords.length > 0) {
+      setDnsCache(address, fallbackRecords[0]);
       return fallbackRecords[0];
     }
-    const fallbackRecordsV6 = await Deno.resolveDns(address, "AAAA");
+    const fallbackRecordsV6 = await withTimeout(
+      Deno.resolveDns(address, "AAAA"),
+      DOH_TIMEOUT_MS,
+    );
     if (fallbackRecordsV6.length > 0) {
+      setDnsCache(address, fallbackRecordsV6[0]);
       return fallbackRecordsV6[0];
     }
   } catch (error) {
     logger.warn(`DNS resolve failed for ${maskIP(address)}`, error);
   }
+  setDnsCache(address, null);
   return null;
 }
 
@@ -925,19 +1243,63 @@ type DohResponse = {
   Status?: number;
 };
 
+function getDnsCache(hostname: string): string | null | undefined {
+  const entry = dnsCache.get(hostname);
+  if (!entry) {
+    return undefined;
+  }
+  if (Date.now() > entry.expiresAt) {
+    dnsCache.delete(hostname);
+    return undefined;
+  }
+  return entry.value;
+}
+
+function setDnsCache(hostname: string, value: string | null) {
+  if (dnsCache.size >= DNS_CACHE_MAX_ENTRIES) {
+    const oldestKey = dnsCache.keys().next().value;
+    if (oldestKey) {
+      dnsCache.delete(oldestKey);
+    }
+  }
+  dnsCache.set(hostname, {
+    value,
+    expiresAt: Date.now() + DNS_CACHE_TTL_MS,
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("Operation timed out"));
+    }, timeoutMs);
+    promise.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    }).catch((error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
 async function resolveDnsOverHttps(
   hostname: string,
   recordType: "A" | "AAAA",
   dohUrl: string,
+  timeoutMs: number,
 ): Promise<string[]> {
   const url = new URL(dohUrl);
   url.searchParams.set("name", hostname);
   url.searchParams.set("type", recordType);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const response = await fetch(url.toString(), {
     headers: {
       accept: "application/dns-json",
     },
-  });
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout));
   if (!response.ok) {
     throw new Error(`DoH request failed with status ${response.status}`);
   }
@@ -1090,9 +1452,31 @@ function filterRequestHeaders(headers: Headers): Headers {
     if (FORWARDED_HEADER_PREFIXES.some((prefix) => lowerKey.startsWith(prefix))) {
       continue;
     }
+    if (REDACTED_REQUEST_HEADERS.has(lowerKey)) {
+      continue;
+    }
     filtered.set(key, value);
   }
   return filtered;
+}
+
+function limitRequestBody(
+  body: ReadableStream<Uint8Array>,
+  maxBytes: number,
+): ReadableStream<Uint8Array> {
+  let received = 0;
+  return body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        received += chunk.length;
+        if (received > maxBytes) {
+          controller.error(new Error("Request body too large"));
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    }),
+  );
 }
 
 function filterResponseHeaders(headers: Headers): Headers {

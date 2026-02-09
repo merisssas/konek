@@ -9,6 +9,7 @@ registerGlobalErrorHandlers(config.logger);
 startVlessServer({
   port: config.port,
   uuid: config.uuid,
+  adminPassword: config.adminPassword,
   masqueradeUrl: config.masqueradeUrl,
   dohUrl: config.dohUrl,
   shadowsocks: config.shadowsocks,
