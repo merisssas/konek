@@ -46,7 +46,7 @@ const DEFAULT_SHADOWSOCKS_METHOD = "chacha20-ietf-poly1305";
 const DEFAULT_SHADOWSOCKS_PASSWORD = "REPLACE_WITH_SHADOWSOCKS_PASSWORD";
 const DEFAULT_SHADOWSOCKS_PORT = 8388;
 const DEFAULT_TROJAN_PASSWORD = "REPLACE_WITH_TROJAN_PASSWORD";
-const DEFAULT_TROJAN_PORT = 443;
+const DEFAULT_TROJAN_PORT = 8443;
 
 function isPlaceholder(value: string, placeholder: string): boolean {
   return value.trim() === "" || value === placeholder;
