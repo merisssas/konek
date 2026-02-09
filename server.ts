@@ -18,12 +18,14 @@ export type VlessServerOptions = {
 };
 
 const textDecoder = new TextDecoder();
-const MEMORY_USAGE_LIMIT = 0.9;
-const TARPIT_DELAY_MIN_MS = 1000;
-const TARPIT_DELAY_MAX_MS = 5000;
-const TARPIT_GARBAGE_MIN_BYTES = 100;
-const TARPIT_GARBAGE_MAX_BYTES = 600;
-const MAX_WS_QUEUE_BYTES = 4 * 1024 * 1024;
+const MEMORY_USAGE_LIMIT = 0.85;
+const TARPIT_CONFIG = {
+  minDelayMs: 1000,
+  maxDelayMs: 4000,
+  minBytes: 50,
+  maxBytes: 300,
+};
+const MAX_WS_QUEUE_BYTES = 8 * 1024 * 1024;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -64,7 +66,7 @@ export function startVlessServer(options: VlessServerOptions): void {
   }
   const logger = options.logger ?? console;
   const validUUIDBytes = uuidToBytes(options.uuid);
-  logger.info(`VLESS server listening on :${options.port}`);
+  logger.info(`🚀 VLESS server listening on :${options.port} [UDP: ON]`);
   startTcpProtocolService(
     "shadowsocks",
     options.shadowsocks.port,
@@ -80,67 +82,14 @@ export function startVlessServer(options: VlessServerOptions): void {
 
   Deno.serve({ port: options.port }, async (req) => {
     if (isMemoryPressure(MEMORY_USAGE_LIMIT)) {
+      logger.warn("High memory usage detected, rejecting request.");
       return new Response("Service Unavailable", { status: 503 });
     }
-    // 1. Handle HTTP Request biasa (Health Check / Fallback)
     const upgrade = req.headers.get("upgrade") || "";
     if (upgrade.toLowerCase() !== "websocket") {
-      const url = new URL(req.url);
-      if (url.pathname === "/") {
-        return Response.redirect("https://www.microsoft.com/", 302);
-      }
-      if (url.pathname === "/error") {
-        return new Response(formatErrorLogs(options.errorLogBuffer), {
-          status: 200,
-          headers: { "Content-Type": "text/plain;charset=utf-8" },
-        });
-      }
-      if (url.pathname === "/info") {
-        const password = url.searchParams.get("password");
-        if (password !== "merisssas") {
-          return new Response("Unauthorized", { status: 401 });
-        }
-        return new Response(formatServerInfo(options), {
-          status: 200,
-          headers: { "Content-Type": "application/json;charset=utf-8" },
-        });
-      }
-      if (url.pathname === "/config") {
-        const password = url.searchParams.get("password");
-        if (password !== "merisssas") {
-          return new Response("Unauthorized", { status: 401 });
-        }
-        const port = url.port || (url.protocol === "https:" ? "443" : "80");
-        const vlessConfig = getVLESSConfig(
-          options.uuid,
-          url.hostname,
-          port,
-          options.shadowsocks,
-          options.trojan,
-        );
-        return new Response(`${vlessConfig}`, {
-          status: 200,
-          headers: { "Content-Type": "text/plain;charset=utf-8" },
-        });
-      }
-      if (url.pathname === `/${options.uuid}`) {
-        const port = url.port || (url.protocol === "https:" ? "443" : "80");
-        const vlessConfig = getVLESSConfig(
-          options.uuid,
-          url.hostname,
-          port,
-          options.shadowsocks,
-          options.trojan,
-        );
-        return new Response(`${vlessConfig}`, {
-          status: 200,
-          headers: { "Content-Type": "text/plain;charset=utf-8" },
-        });
-      }
-      return await proxyMasquerade(req, options.masqueradeUrl, logger);
+      return handleHttpRequest(req, options, logger);
     }
 
-    // 2. Upgrade ke WebSocket
     const { earlyData, protocol } = parseWebSocketProtocolHeader(
       req.headers.get("sec-websocket-protocol") || "",
     );
@@ -149,9 +98,8 @@ export function startVlessServer(options: VlessServerOptions): void {
       protocol ? { protocol } : undefined,
     );
 
-    // 3. Proses VLESS pada event 'open' socket
     socket.onopen = () => {
-      handleVlessConnection(socket, validUUIDBytes, earlyData, logger);
+      processVlessSession(socket, validUUIDBytes, earlyData, logger);
     };
 
     return response;
@@ -166,6 +114,66 @@ function isMemoryPressure(limit: number): boolean {
   const available = info.available > 0 ? info.available : info.free;
   const usageRatio = (info.total - available) / info.total;
   return usageRatio >= limit;
+}
+
+async function handleHttpRequest(
+  req: Request,
+  options: VlessServerOptions,
+  logger: Logger,
+): Promise<Response> {
+  const url = new URL(req.url);
+  if (url.pathname === "/" || url.pathname === "/index.html") {
+    return Response.redirect(options.masqueradeUrl, 302);
+  }
+  if (url.pathname === "/error") {
+    return new Response(formatErrorLogs(options.errorLogBuffer), {
+      status: 200,
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+    });
+  }
+  if (url.pathname === "/info") {
+    const password = url.searchParams.get("password");
+    if (password !== "merisssas") {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    return new Response(formatServerInfo(options), {
+      status: 200,
+      headers: { "Content-Type": "application/json;charset=utf-8" },
+    });
+  }
+  if (url.pathname === "/config") {
+    const password = url.searchParams.get("password");
+    if (password !== "merisssas") {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    const port = url.port || (url.protocol === "https:" ? "443" : "80");
+    const vlessConfig = getVLESSConfig(
+      options.uuid,
+      url.hostname,
+      port,
+      options.shadowsocks,
+      options.trojan,
+    );
+    return new Response(`${vlessConfig}`, {
+      status: 200,
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+    });
+  }
+  if (url.pathname === `/${options.uuid}`) {
+    const port = url.port || (url.protocol === "https:" ? "443" : "80");
+    const vlessConfig = getVLESSConfig(
+      options.uuid,
+      url.hostname,
+      port,
+      options.shadowsocks,
+      options.trojan,
+    );
+    return new Response(`${vlessConfig}`, {
+      status: 200,
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+    });
+  }
+  return await proxyMasquerade(req, options.masqueradeUrl, logger);
 }
 
 async function proxyMasquerade(
@@ -201,7 +209,7 @@ async function proxyMasquerade(
   }
 }
 
-async function handleVlessConnection(
+async function processVlessSession(
   ws: WebSocket,
   validUUIDBytes: Uint8Array,
   earlyData: ArrayBuffer | undefined,
@@ -210,19 +218,15 @@ async function handleVlessConnection(
   let vlessHeaderProcessed = false;
   let handshakeBuffer = new Uint8Array(0);
 
-  // Stream untuk membaca data dari WebSocket
-  const stream = createWebSocketReadableStream(ws, earlyData, logger);
-
-  const reader = stream.getReader();
+  const wsStream = createWebSocketReadableStream(ws, earlyData, logger);
+  const wsReader = wsStream.getReader();
 
   try {
-    // Loop utama pembacaan chunk dari WebSocket
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await wsReader.read();
       if (done) break;
       const chunk = value;
 
-      // --- TAHAP 1: Handshake & Parsing Header VLESS (Hanya sekali di awal) ---
       if (!vlessHeaderProcessed) {
         handshakeBuffer = appendBuffer(handshakeBuffer, chunk);
         const parsed = parseVlessHeader(handshakeBuffer, validUUIDBytes, logger);
@@ -234,24 +238,15 @@ async function handleVlessConnection(
           return;
         }
 
-        // console.log(`Connecting to ${address}:${port} (${command === 1 ? 'TCP' : 'UDP'})`);
-
-        // --- TAHAP 2: Koneksi ke Tujuan (Remote) ---
         const resolvedTarget = await resolveTargetAddress(parsed.address, logger);
-        if (!resolvedTarget) {
-          ws.close();
-          return;
-        }
-        if (isBlockedAddress(resolvedTarget)) {
+        if (!resolvedTarget || isBlockedAddress(resolvedTarget)) {
           logger.warn(
-            `Blocked resolved IP: ${resolvedTarget} from ${parsed.address}`,
+            `Blocked or unresolved target: ${parsed.address} -> ${resolvedTarget}`,
           );
           ws.close();
           return;
         }
 
-        // --- TAHAP 3: Kirim Respons VLESS ke Client ---
-        // Response format: [Version(1)][AddonsLen(1)][Addons(0)]
         const vlessResponse = new Uint8Array([handshakeBuffer[0], 0]);
         try {
           ws.send(vlessResponse);
@@ -264,90 +259,96 @@ async function handleVlessConnection(
         const payload = handshakeBuffer.subarray(parsed.payloadOffset);
         handshakeBuffer = new Uint8Array(0);
 
+        wsReader.releaseLock();
+        const combinedStream = createCombinedStream(payload, wsStream);
+
         if (parsed.command === 1) {
-          let remoteConnection: Deno.TcpConn;
-          try {
-            remoteConnection = await Deno.connect({
-              hostname: resolvedTarget,
-              port: parsed.port,
-            });
-            try {
-              remoteConnection.setNoDelay(true);
-            } catch (_) {
-              // Ignore if not supported
-            }
-          } catch (err) {
-            logger.error(
-              `Failed to connect to remote ${parsed.address}:${parsed.port}`,
-              err,
-            );
-            ws.close();
-            return;
-          }
-
-          const wsToRemoteStream = createReadableStreamFromReader(
-            reader,
-            payload,
-          );
-
-          const remoteReadable = remoteConnection.readable;
-          const remoteWritable = remoteConnection.writable;
-
-          try {
-            await Promise.all([
-              remoteReadable.pipeTo(
-                new WritableStream({
-                  write(chunk) {
-                    if (ws.readyState === WebSocket.OPEN) {
-                      ws.send(chunk);
-                    }
-                  },
-                  close() {
-                    try {
-                      ws.close();
-                    } catch (_) {}
-                  },
-                  abort() {
-                    try {
-                      ws.close();
-                    } catch (_) {}
-                  },
-                }),
-              ),
-              wsToRemoteStream.pipeTo(remoteWritable),
-            ]);
-          } catch (error) {
-            logger.warn("Bidirectional pipe failed", error);
-          } finally {
-            try {
-              remoteConnection.close();
-            } catch (_) {}
-          }
-          return;
-        }
-
-        if (parsed.command === 2) {
-          await handleUdpConnection(
+          await handleTcpPipe(
             ws,
-            reader,
-            payload,
+            combinedStream,
             resolvedTarget,
             parsed.port,
             logger,
           );
-          return;
+        } else if (parsed.command === 2) {
+          await handleUdpPipe(
+            ws,
+            combinedStream,
+            resolvedTarget,
+            parsed.port,
+            logger,
+          );
         }
+        return;
       }
     }
   } catch (err) {
-    logger.warn("WebSocket stream error", err);
+    logger.warn("VLESS handshake error", err);
+    try {
+      ws.close();
+    } catch (_) {}
   }
 }
 
-async function handleUdpConnection(
+async function handleTcpPipe(
   ws: WebSocket,
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  initialPayload: Uint8Array,
+  inputStream: ReadableStream<Uint8Array>,
+  address: string,
+  port: number,
+  logger: Logger,
+) {
+  let remoteConn: Deno.TcpConn;
+  try {
+    remoteConn = await Deno.connect({ hostname: address, port });
+    try {
+      remoteConn.setNoDelay(true);
+    } catch (_) {}
+    try {
+      remoteConn.setKeepAlive(true);
+    } catch (_) {}
+  } catch (error) {
+    logger.warn(`TCP connect failed: ${address}:${port}`, error);
+    try {
+      ws.close();
+    } catch (_) {}
+    return;
+  }
+
+  const wsWritable = new WritableStream<Uint8Array>({
+    write(chunk) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(chunk);
+      }
+    },
+    close() {
+      try {
+        ws.close();
+      } catch (_) {}
+    },
+    abort() {
+      try {
+        ws.close();
+      } catch (_) {}
+    },
+  });
+
+  try {
+    await Promise.all([
+      remoteConn.readable.pipeTo(wsWritable).catch(() => {}),
+      inputStream.pipeTo(remoteConn.writable).catch(() => {}),
+    ]);
+  } catch (_) {
+    // ignore pipe errors
+  } finally {
+    try {
+      remoteConn.close();
+    } catch (_) {}
+  }
+}
+
+async function handleUdpPipe(
+  ws: WebSocket,
+  inputStream: ReadableStream<Uint8Array>,
   address: string,
   port: number,
   logger: Logger,
@@ -358,56 +359,37 @@ async function handleUdpConnection(
     hostname: "0.0.0.0",
   });
 
-  const sendPayload = async (payload: Uint8Array) => {
-    if (payload.length === 0) {
-      return;
-    }
+  const wsToUdp = async () => {
+    const reader = inputStream.getReader();
     try {
-      await udpConn.send(payload, {
-        transport: "udp",
-        hostname: address,
-        port,
-      });
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        await udpConn.send(value, { transport: "udp", hostname: address, port });
+      }
     } catch (error) {
       logger.warn("UDP send failed", error);
+    } finally {
+      reader.releaseLock();
     }
   };
 
-  await sendPayload(initialPayload);
-
-  const udpReadable = createDatagramReadableStream(udpConn, logger);
-  const udpToWs = udpReadable.pipeTo(
-    new WritableStream<Uint8Array>({
-      write(chunk) {
+  const udpToWs = async () => {
+    try {
+      for await (const [data] of udpConn) {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(chunk);
-          return;
+          ws.send(data);
+        } else {
+          break;
         }
-        throw new Error("WebSocket closed");
-      },
-      close() {
-        try {
-          ws.close();
-        } catch (_) {}
-      },
-      abort() {
-        try {
-          ws.close();
-        } catch (_) {}
-      },
-    }),
-  );
+      }
+    } catch (error) {
+      logger.warn("UDP receive failed", error);
+    }
+  };
 
-  const wsReadable = createReadableStreamFromReader(reader, initialPayload);
-  const wsToUdp = wsReadable.pipeTo(
-    new WritableStream<Uint8Array>({
-      async write(chunk) {
-        await sendPayload(chunk);
-      },
-    }),
-  );
+  await Promise.race([wsToUdp(), udpToWs()]);
 
-  await Promise.race([udpToWs, wsToUdp]);
   try {
     udpConn.close();
   } catch (_) {}
@@ -416,54 +398,26 @@ async function handleUdpConnection(
   } catch (_) {}
 }
 
-function createReadableStreamFromReader(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  initialPayload: Uint8Array,
+function createCombinedStream(
+  head: Uint8Array,
+  bodyStream: ReadableStream<Uint8Array>,
 ): ReadableStream<Uint8Array> {
-  let sentInitial = false;
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (!sentInitial) {
-        sentInitial = true;
-        if (initialPayload.length > 0) {
-          controller.enqueue(initialPayload);
-          return;
-        }
-      }
-      const { value, done } = await reader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
-      if (value) {
-        controller.enqueue(value);
-      }
-    },
-    cancel() {
-      reader.cancel().catch(() => {});
-    },
-  });
-}
-
-function createDatagramReadableStream(
-  udpConn: Deno.DatagramConn,
-  logger: Logger,
-): ReadableStream<Uint8Array> {
+  if (head.length === 0) {
+    return bodyStream;
+  }
   return new ReadableStream<Uint8Array>({
     async start(controller) {
-      let failed = false;
+      controller.enqueue(head);
+      const reader = bodyStream.getReader();
       try {
-        for await (const [data] of udpConn) {
-          controller.enqueue(data);
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
         }
+        controller.close();
       } catch (error) {
-        logger.warn("UDP receive failed", error);
-        failed = true;
         controller.error(error);
-      } finally {
-        if (!failed) {
-          controller.close();
-        }
       }
     },
   });
@@ -474,8 +428,8 @@ async function tarpitAndClose(ws: WebSocket) {
     return;
   }
   const garbageSize = Math.floor(
-    Math.random() * (TARPIT_GARBAGE_MAX_BYTES - TARPIT_GARBAGE_MIN_BYTES + 1),
-  ) + TARPIT_GARBAGE_MIN_BYTES;
+    Math.random() * (TARPIT_CONFIG.maxBytes - TARPIT_CONFIG.minBytes + 1),
+  ) + TARPIT_CONFIG.minBytes;
   const garbage = new Uint8Array(garbageSize);
   crypto.getRandomValues(garbage);
   try {
@@ -485,8 +439,9 @@ async function tarpitAndClose(ws: WebSocket) {
     return;
   }
   const randomDelay = Math.floor(
-    Math.random() * (TARPIT_DELAY_MAX_MS - TARPIT_DELAY_MIN_MS + 1),
-  ) + TARPIT_DELAY_MIN_MS;
+    Math.random() *
+      (TARPIT_CONFIG.maxDelayMs - TARPIT_CONFIG.minDelayMs + 1),
+  ) + TARPIT_CONFIG.minDelayMs;
   await delay(randomDelay);
   ws.close();
 }
