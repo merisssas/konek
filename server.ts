@@ -422,10 +422,8 @@ async function processVlessSession(
         }
 
         const vlessResponse = new Uint8Array([handshakeBuffer[0], 0]);
-        try {
-          ws.send(vlessResponse);
-        } catch (_) {
-          ws.close();
+        if (!sendWebSocketMessage(ws, vlessResponse, logger, "handshake")) {
+          safeCloseWebSocket(ws);
           return;
         }
 
@@ -552,18 +550,16 @@ async function handleTcpPipe(
     write(chunk) {
       if (ws.readyState === WebSocket.OPEN) {
         markActivity();
-        ws.send(chunk);
+        if (!sendWebSocketMessage(ws, chunk, logger, "tcp->ws")) {
+          closeAll();
+        }
       }
     },
     close() {
-      try {
-        ws.close();
-      } catch (_) {}
+      safeCloseWebSocket(ws);
     },
     abort() {
-      try {
-        ws.close();
-      } catch (_) {}
+      safeCloseWebSocket(ws);
     },
   });
 
@@ -730,7 +726,9 @@ async function handleUdpPipe(
           framed[0] = (data.length >> 8) & 0xff;
           framed[1] = data.length & 0xff;
           framed.set(data, 2);
-          ws.send(framed);
+          if (!sendWebSocketMessage(ws, framed, logger, "udp->ws")) {
+            break;
+          }
         } else {
           break;
         }
@@ -795,10 +793,8 @@ async function tarpitAndClose(ws: WebSocket, loadAdvisor: LoadAdvisor) {
   ) + TARPIT_CONFIG.minBytes;
   const garbage = new Uint8Array(garbageSize);
   crypto.getRandomValues(garbage);
-  try {
-    ws.send(garbage);
-  } catch (_) {
-    ws.close();
+  if (!sendWebSocketMessage(ws, garbage, null, "tarpit")) {
+    safeCloseWebSocket(ws);
     return;
   }
   const randomDelay = Math.floor(
@@ -807,6 +803,32 @@ async function tarpitAndClose(ws: WebSocket, loadAdvisor: LoadAdvisor) {
   ) + TARPIT_CONFIG.minDelayMs;
   await delay(randomDelay);
   ws.close();
+}
+
+function sendWebSocketMessage(
+  ws: WebSocket,
+  data: Uint8Array,
+  logger: Logger | null,
+  context: string,
+): boolean {
+  if (ws.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  try {
+    ws.send(data);
+    return true;
+  } catch (error) {
+    if (logger) {
+      logger.warn(`WebSocket send failed (${context})`, error);
+    }
+    return false;
+  }
+}
+
+function safeCloseWebSocket(ws: WebSocket) {
+  try {
+    ws.close();
+  } catch (_) {}
 }
 
 function parseWebSocketProtocolHeader(
