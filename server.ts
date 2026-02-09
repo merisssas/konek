@@ -1,9 +1,4 @@
 import type { ErrorLogBuffer, Logger } from "./logger.ts";
-import type {
-  ShadowsocksConfig,
-  TrojanConfig,
-  ProtocolCommandConfig,
-} from "./config.ts";
 import { maskIP, uuidToBytes } from "./utils.ts";
 
 export type VlessServerOptions = {
@@ -12,9 +7,6 @@ export type VlessServerOptions = {
   adminPassword: string;
   masqueradeUrl: string;
   dohUrl: string | null;
-  shadowsocks: ShadowsocksConfig;
-  trojan: TrojanConfig;
-  protocolCommands: ProtocolCommandConfig;
   errorLogBuffer: ErrorLogBuffer;
   logger?: Logger;
 };
@@ -120,18 +112,6 @@ export function startVlessServer(options: VlessServerOptions): void {
   const logger = options.logger ?? console;
   const sessionLimiter = createSessionLimiter(MAX_CONCURRENT_SESSIONS);
   logger.info(`🚀 VLESS server listening on :${options.port} [UDP: ON]`);
-  startTcpProtocolService(
-    "shadowsocks",
-    options.shadowsocks.port,
-    logger,
-    options.protocolCommands.shadowsocks,
-  );
-  startTcpProtocolService(
-    "trojan",
-    options.trojan.port,
-    logger,
-    options.protocolCommands.trojan,
-  );
 
   Deno.serve({ port: options.port }, async (req) => {
     if (isMemoryPressure(MEMORY_USAGE_LIMIT)) {
@@ -279,8 +259,6 @@ async function handleHttpRequest(
       options.uuid,
       url.hostname,
       port,
-      options.shadowsocks,
-      options.trojan,
     );
     return new Response(`${vlessConfig}`, {
       status: 200,
@@ -293,8 +271,6 @@ async function handleHttpRequest(
       options.uuid,
       url.hostname,
       port,
-      options.shadowsocks,
-      options.trojan,
     );
     return new Response(`${vlessConfig}`, {
       status: 200,
@@ -804,25 +780,14 @@ function getVLESSConfig(
   userID: string,
   hostName: string,
   port: string,
-  shadowsocks: ShadowsocksConfig,
-  trojan: TrojanConfig,
 ): string {
   const vlessMain =
     `vless://${userID}\u0040${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
-  const shadowsocksUserInfo = base64Encode(
-    `${shadowsocks.method}:${shadowsocks.password}`,
-  );
-  const shadowsocksLink =
-    `ss://${shadowsocksUserInfo}\u0040${hostName}:${shadowsocks.port}#${hostName}-ss`;
-  const trojanLink =
-    `trojan://${trojan.password}\u0040${hostName}:${trojan.port}?sni=${hostName}&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}-trojan`;
   return `
 ################################################################
 v2ray
 ---------------------------------------------------------------
 ${vlessMain}
-${shadowsocksLink}
-${trojanLink}
 ---------------------------------------------------------------
 ################################################################
 clash-meta
@@ -842,168 +807,8 @@ clash-meta
     headers:
       host: ${hostName}
 ---------------------------------------------------------------
-- type: ss
-  name: ${hostName}-ss
-  server: ${hostName}
-  port: ${shadowsocks.port}
-  cipher: ${shadowsocks.method}
-  password: ${shadowsocks.password}
-  udp: true
----------------------------------------------------------------
-- type: trojan
-  name: ${hostName}-trojan
-  server: ${hostName}
-  port: ${trojan.port}
-  password: ${trojan.password}
-  udp: true
-  sni: ${hostName}
-  network: ws
-  ws-opts:
-    path: "/?ed=2048"
-    headers:
-      host: ${hostName}
----------------------------------------------------------------
 ################################################################
 `;
-}
-
-function base64Encode(value: string): string {
-  return btoa(value);
-}
-
-function startTcpProtocolService(
-  name: string,
-  port: number,
-  logger: Logger,
-  command?: string,
-) {
-  if (command?.trim()) {
-    startExternalCommand(name, command, logger);
-    return;
-  }
-  startTcpProtocolListener(name, port, logger);
-}
-
-function startExternalCommand(
-  name: string,
-  command: string,
-  logger: Logger,
-) {
-  const parts = parseCommand(command);
-  if (parts.length === 0) {
-    logger.warn(`${name} command is empty, falling back to dummy listener`);
-    return;
-  }
-  const [cmd, ...args] = parts;
-  logger.info(`${name} daemon starting: ${command}`);
-  try {
-    const process = new Deno.Command(cmd, {
-      args,
-      stdin: "null",
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
-    pipeProcessOutput(process, name, logger);
-  } catch (error) {
-    logger.error(`${name} daemon failed to start`, error);
-  }
-}
-
-function pipeProcessOutput(
-  process: Deno.ChildProcess,
-  name: string,
-  logger: Logger,
-) {
-  const decoder = new TextDecoder();
-  const logStream = async (
-    stream: ReadableStream<Uint8Array> | null,
-    level: "info" | "error",
-  ) => {
-    if (!stream) return;
-    try {
-      for await (const chunk of stream) {
-        const text = decoder.decode(chunk).trim();
-        if (text) {
-          logger[level](`[${name}] ${text}`);
-        }
-      }
-    } catch (error) {
-      logger.warn(`${name} daemon log stream failed`, error);
-    }
-  };
-  logStream(process.stdout, "info");
-  logStream(process.stderr, "error");
-  process.status.then((status) => {
-    if (status.success) {
-      logger.info(`${name} daemon exited`);
-    } else {
-      logger.warn(`${name} daemon exited with code ${status.code}`);
-    }
-  }).catch((error) => {
-    logger.error(`${name} daemon status error`, error);
-  });
-}
-
-function parseCommand(command: string): string[] {
-  const parts: string[] = [];
-  let current = "";
-  let inSingleQuote = false;
-  let inDoubleQuote = false;
-  let escapeNext = false;
-
-  for (const char of command) {
-    if (escapeNext) {
-      current += char;
-      escapeNext = false;
-      continue;
-    }
-    if (char === "\\") {
-      escapeNext = true;
-      continue;
-    }
-    if (char === "'" && !inDoubleQuote) {
-      inSingleQuote = !inSingleQuote;
-      continue;
-    }
-    if (char === '"' && !inSingleQuote) {
-      inDoubleQuote = !inDoubleQuote;
-      continue;
-    }
-    if (!inSingleQuote && !inDoubleQuote && /\s/.test(char)) {
-      if (current) {
-        parts.push(current);
-        current = "";
-      }
-      continue;
-    }
-    current += char;
-  }
-  if (current) {
-    parts.push(current);
-  }
-  return parts;
-}
-
-function startTcpProtocolListener(
-  name: string,
-  port: number,
-  logger: Logger,
-) {
-  let listener: Deno.Listener;
-  try {
-    listener = Deno.listen({ port });
-  } catch (error) {
-    logger.warn(`${name} listener failed to start on :${port}`, error);
-    return;
-  }
-  logger.info(`${name} listener running on :${port}`);
-  (async () => {
-    for await (const conn of listener) {
-      conn.close();
-    }
-  })().catch((error) => {
-    logger.error(`${name} listener failed`, error);
-  });
 }
 
 function formatErrorLogs(errorLogBuffer: ErrorLogBuffer): string {
@@ -1032,14 +837,6 @@ function formatServerInfo(options: VlessServerOptions): string {
       uuid: options.uuid,
       masqueradeUrl: options.masqueradeUrl,
       dohUrl: options.dohUrl,
-      shadowsocks: {
-        port: options.shadowsocks.port,
-        method: options.shadowsocks.method,
-      },
-      trojan: {
-        port: options.trojan.port,
-      },
-      protocolCommands: options.protocolCommands,
     },
     errors: {
       count: options.errorLogBuffer.size(),

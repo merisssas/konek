@@ -12,9 +12,6 @@ startVlessServer({
   adminPassword: config.adminPassword,
   masqueradeUrl: config.masqueradeUrl,
   dohUrl: config.dohUrl,
-  shadowsocks: config.shadowsocks,
-  trojan: config.trojan,
-  protocolCommands: config.protocolCommands,
   errorLogBuffer: config.errorLogBuffer,
   logger: config.logger,
 });
