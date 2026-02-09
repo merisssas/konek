@@ -90,7 +90,13 @@ export function startVlessServer(options: VlessServerOptions): void {
     );
 
     socket.onopen = () => {
-      processVlessSession(socket, validUUIDBytes, earlyData, logger);
+      processVlessSession(
+        socket,
+        validUUIDBytes,
+        earlyData,
+        options.dohUrl,
+        logger,
+      );
     };
 
     return response;
@@ -204,6 +210,7 @@ async function processVlessSession(
   ws: WebSocket,
   validUUIDBytes: Uint8Array,
   earlyData: ArrayBuffer | undefined,
+  dohUrl: string | null,
   logger: Logger,
 ) {
   let vlessHeaderProcessed = false;
@@ -231,7 +238,7 @@ async function processVlessSession(
 
         const resolvedTarget = await resolveTargetAddress(
           parsed.address,
-          options.dohUrl,
+          dohUrl,
           logger,
         );
         if (!resolvedTarget || isBlockedAddress(resolvedTarget)) {
