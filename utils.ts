@@ -41,6 +41,27 @@ export function parseLogLevel(
   return normalized as LogLevel;
 }
 
+export function parseBoolean(
+  value: string | undefined,
+  fallback: boolean,
+): boolean {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no", "n", "off"].includes(normalized)) {
+    return false;
+  }
+
+  throw new Error(
+    `Boolean value must be one of true/false/1/0/yes/no/on/off. Received: ${value}`,
+  );
+}
+
 export function isValidUUID(uuid: string): boolean {
   const uuidRegex =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

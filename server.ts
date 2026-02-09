@@ -388,18 +388,16 @@ async function handleUdpPipe(
   }, UDP_IDLE_CHECK_INTERVAL_MS);
 
   const wsToUdp = async () => {
-    const reader = inputStream.getReader();
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+    const udpWriter = new WritableStream<Uint8Array>({
+      async write(chunk) {
         markActivity();
-        await udpConn.send(value, { transport: "udp", hostname: address, port });
-      }
+        await udpConn.send(chunk, { transport: "udp", hostname: address, port });
+      },
+    });
+    try {
+      await inputStream.pipeTo(udpWriter);
     } catch (error) {
       logger.warn("UDP send failed", error);
-    } finally {
-      reader.releaseLock();
     }
   };
 
@@ -436,14 +434,20 @@ function createCombinedStream(
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       controller.enqueue(head);
-      const reader = bodyStream.getReader();
       try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          controller.enqueue(value);
-        }
-        controller.close();
+        await bodyStream.pipeTo(
+          new WritableStream<Uint8Array>({
+            write(chunk) {
+              controller.enqueue(chunk);
+            },
+            close() {
+              controller.close();
+            },
+            abort(error) {
+              controller.error(error);
+            },
+          }),
+        );
       } catch (error) {
         controller.error(error);
       }

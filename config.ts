@@ -1,10 +1,17 @@
 import { createLogger, type LogLevel, type Logger } from "./logger.ts";
-import { isValidUUID, parseLogLevel, parsePort, readEnv } from "./utils.ts";
+import {
+  isValidUUID,
+  parseBoolean,
+  parseLogLevel,
+  parsePort,
+  readEnv,
+} from "./utils.ts";
 
 export type AppConfig = {
   uuid: string;
   port: number;
   logLevel: LogLevel;
+  stealthMode: boolean;
   masqueradeUrl: string;
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
@@ -32,6 +39,8 @@ export type ProtocolCommandConfig = {
 const DEFAULT_UUID = "841b9534-793e-4363-9976-59915e6659f4";
 const DEFAULT_PORT = 8080;
 const DEFAULT_LOG_LEVEL: LogLevel = "none";
+const DEFAULT_VERBOSE_LOG_LEVEL: LogLevel = "debug";
+const DEFAULT_STEALTH_MODE = true;
 const DEFAULT_MASQUERADE_URL = "https://www.microsoft.com/";
 const DEFAULT_SHADOWSOCKS_METHOD = "chacha20-ietf-poly1305";
 const DEFAULT_SHADOWSOCKS_PASSWORD = "REPLACE_WITH_SHADOWSOCKS_PASSWORD";
@@ -46,7 +55,13 @@ function isPlaceholder(value: string, placeholder: string): boolean {
 export async function loadConfig(): Promise<AppConfig> {
   const uuid = readEnv("UUID") ?? DEFAULT_UUID;
   const port = parsePort(readEnv("PORT"), DEFAULT_PORT);
-  const logLevel = parseLogLevel(readEnv("LOG_LEVEL"), DEFAULT_LOG_LEVEL);
+  const stealthMode = parseBoolean(
+    readEnv("STEALTH_MODE"),
+    DEFAULT_STEALTH_MODE,
+  );
+  const logLevel = stealthMode
+    ? DEFAULT_LOG_LEVEL
+    : parseLogLevel(readEnv("LOG_LEVEL"), DEFAULT_VERBOSE_LOG_LEVEL);
   const masqueradeUrl = readEnv("MASQUERADE_URL") ?? DEFAULT_MASQUERADE_URL;
 
   const rawShadowsocksPassword = readEnv("SHADOWSOCKS_PASSWORD") ??
@@ -96,6 +111,7 @@ export async function loadConfig(): Promise<AppConfig> {
     uuid,
     port,
     logLevel,
+    stealthMode,
     masqueradeUrl,
     shadowsocks,
     trojan,
