@@ -37,12 +37,16 @@ const SESSION_HIGH_WATER_MARK = Math.floor(MAX_CONCURRENT_SESSIONS * 0.9);
 const MAX_UDP_DATAGRAM_SIZE = 1400;
 const UDP_MAX_PACKETS_PER_SECOND = 200;
 const UDP_BURST_PACKETS = 400;
+const UDP_MAX_BYTES_PER_SECOND = UDP_MAX_PACKETS_PER_SECOND *
+  MAX_UDP_DATAGRAM_SIZE;
+const UDP_BURST_BYTES = UDP_BURST_PACKETS * MAX_UDP_DATAGRAM_SIZE;
 const UDP_IDLE_TIMEOUT_MS = 15_000;
 const UDP_IDLE_CHECK_INTERVAL_MS = 1_000;
 const DNS_CACHE_TTL_MS = 60_000;
 const DNS_CACHE_MAX_ENTRIES = 500;
 const DNS_MAX_RESOLVES_PER_SESSION = 4;
 const DOH_TIMEOUT_MS = 1500;
+const DNS_FALLBACK_TIMEOUT_MS = 2500;
 const PROXY_MAX_BODY_BYTES = 1024 * 1024;
 
 const ALLOWED_MASQUERADE_METHODS = new Set(["GET", "HEAD", "POST"]);
@@ -104,7 +108,12 @@ function createSessionLimiter(maxSessions: number): SessionLimiter {
         return null;
       }
       activeSessions += 1;
+      let released = false;
       return () => {
+        if (released) {
+          return;
+        }
+        released = true;
         activeSessions = Math.max(0, activeSessions - 1);
       };
     },
@@ -313,12 +322,16 @@ async function proxyMasquerade(
   if (!ALLOWED_MASQUERADE_METHODS.has(method)) {
     return new Response("Method Not Allowed", { status: 405 });
   }
+  if (req.headers.has("content-length") && req.headers.has("transfer-encoding")) {
+    return new Response("Bad Request", { status: 400 });
+  }
   const incomingUrl = new URL(req.url);
   const targetUrl = new URL(masqueradeUrl);
   targetUrl.pathname = incomingUrl.pathname;
   targetUrl.search = incomingUrl.search;
 
   const headers = filterRequestHeaders(req.headers);
+  headers.delete("accept-encoding");
   headers.set("host", targetUrl.host);
   const contentLength = req.headers.get("content-length");
   if (contentLength && Number(contentLength) > PROXY_MAX_BODY_BYTES) {
@@ -362,10 +375,14 @@ async function processVlessSession(
   let vlessHeaderProcessed = false;
   let handshakeBuffer = new Uint8Array(0);
   const sessionState: SessionState = { resolveCount: 0 };
+  let wsReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
   const handshakeTimer = setTimeout(() => {
     if (!vlessHeaderProcessed) {
       logger.warn("VLESS handshake timeout.");
+      if (wsReader) {
+        wsReader.cancel("handshake timeout").catch(() => {});
+      }
       try {
         ws.close();
       } catch (_) {}
@@ -373,7 +390,7 @@ async function processVlessSession(
   }, HANDSHAKE_TIMEOUT_MS);
 
   const wsStream = createWebSocketReadableStream(ws, earlyData, logger);
-  const wsReader = wsStream.getReader();
+  wsReader = wsStream.getReader();
 
   try {
     while (true) {
@@ -508,6 +525,9 @@ async function handleTcpPipe(
     if (closed) return;
     closed = true;
     try {
+      inputStream.cancel("tcp closed");
+    } catch (_) {}
+    try {
       remoteConn.close();
     } catch (_) {}
     try {
@@ -574,17 +594,25 @@ async function handleUdpPipe(
   const udpConn = Deno.listenDatagram({
     port: 0,
     transport: "udp",
-    hostname: "0.0.0.0",
+    hostname: "127.0.0.1",
   });
   let closed = false;
   let lastActivity = Date.now();
-  const outboundLimiter = createTokenBucket(
+  const outboundPacketLimiter = createTokenBucket(
     UDP_MAX_PACKETS_PER_SECOND,
     UDP_BURST_PACKETS,
   );
-  const inboundLimiter = createTokenBucket(
+  const inboundPacketLimiter = createTokenBucket(
     UDP_MAX_PACKETS_PER_SECOND,
     UDP_BURST_PACKETS,
+  );
+  const outboundByteLimiter = createTokenBucket(
+    UDP_MAX_BYTES_PER_SECOND,
+    UDP_BURST_BYTES,
+  );
+  const inboundByteLimiter = createTokenBucket(
+    UDP_MAX_BYTES_PER_SECOND,
+    UDP_BURST_BYTES,
   );
 
   const closeAll = () => {
@@ -592,6 +620,9 @@ async function handleUdpPipe(
       return;
     }
     closed = true;
+    try {
+      inputStream.cancel("udp closed");
+    } catch (_) {}
     try {
       udpConn.close();
     } catch (_) {}
@@ -656,7 +687,10 @@ async function handleUdpPipe(
           }
           const payload = buffer.subarray(2, 2 + size);
           buffer = buffer.subarray(2 + size);
-          if (!outboundLimiter.consume(1)) {
+          if (
+            !outboundPacketLimiter.consume(1) ||
+            !outboundByteLimiter.consume(payload.length)
+          ) {
             continue;
           }
           await udpConn.send(payload, {
@@ -680,10 +714,14 @@ async function handleUdpPipe(
         if (data.length > MAX_UDP_DATAGRAM_SIZE) {
           continue;
         }
-        if (!inboundLimiter.consume(1)) {
+        if (
+          !inboundPacketLimiter.consume(1) ||
+          !inboundByteLimiter.consume(data.length)
+        ) {
           continue;
         }
         if (ws.readyState === WebSocket.OPEN) {
+          // Custom UDP framing over WS: 2-byte big-endian length prefix.
           const framed = new Uint8Array(2 + data.length);
           framed[0] = (data.length >> 8) & 0xff;
           framed[1] = data.length & 0xff;
@@ -1217,7 +1255,7 @@ async function resolveTargetAddress(
   try {
     const fallbackRecords = await withTimeout(
       Deno.resolveDns(address, "A"),
-      DOH_TIMEOUT_MS,
+      DNS_FALLBACK_TIMEOUT_MS,
     );
     if (fallbackRecords.length > 0) {
       setDnsCache(address, fallbackRecords[0]);
@@ -1225,7 +1263,7 @@ async function resolveTargetAddress(
     }
     const fallbackRecordsV6 = await withTimeout(
       Deno.resolveDns(address, "AAAA"),
-      DOH_TIMEOUT_MS,
+      DNS_FALLBACK_TIMEOUT_MS,
     );
     if (fallbackRecordsV6.length > 0) {
       setDnsCache(address, fallbackRecordsV6[0]);
@@ -1252,6 +1290,8 @@ function getDnsCache(hostname: string): string | null | undefined {
     dnsCache.delete(hostname);
     return undefined;
   }
+  dnsCache.delete(hostname);
+  dnsCache.set(hostname, entry);
   return entry.value;
 }
 
