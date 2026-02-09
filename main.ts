@@ -7,6 +7,7 @@ startVlessServer({
   port: config.port,
   uuid: config.uuid,
   masqueradeUrl: config.masqueradeUrl,
+  dohUrl: config.dohUrl,
   shadowsocks: config.shadowsocks,
   trojan: config.trojan,
   protocolCommands: config.protocolCommands,

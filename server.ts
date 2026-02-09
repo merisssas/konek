@@ -10,6 +10,7 @@ export type VlessServerOptions = {
   port: number;
   uuid: string;
   masqueradeUrl: string;
+  dohUrl: string;
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
   protocolCommands: ProtocolCommandConfig;
@@ -228,7 +229,11 @@ async function processVlessSession(
           return;
         }
 
-        const resolvedTarget = await resolveTargetAddress(parsed.address, logger);
+        const resolvedTarget = await resolveTargetAddress(
+          parsed.address,
+          options.dohUrl,
+          logger,
+        );
         if (!resolvedTarget || isBlockedAddress(resolvedTarget)) {
           const maskedAddress = maskIP(parsed.address);
           const maskedTarget = resolvedTarget ? maskIP(resolvedTarget) : "null";
@@ -732,6 +737,7 @@ function formatServerInfo(options: VlessServerOptions): string {
       port: options.port,
       uuid: options.uuid,
       masqueradeUrl: options.masqueradeUrl,
+      dohUrl: options.dohUrl,
       shadowsocks: {
         port: options.shadowsocks.port,
         method: options.shadowsocks.method,
@@ -872,24 +878,68 @@ function isBlockedAddress(address: string): boolean {
 
 async function resolveTargetAddress(
   address: string,
+  dohUrl: string,
   logger: Logger,
 ): Promise<string | null> {
   if (address.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(address)) {
     return address;
   }
   try {
-    const records = await Deno.resolveDns(address, "A");
+    const records = await resolveDnsOverHttps(address, "A", dohUrl);
     if (records.length > 0) {
       return records[0];
     }
-    const recordsV6 = await Deno.resolveDns(address, "AAAA");
+    const recordsV6 = await resolveDnsOverHttps(address, "AAAA", dohUrl);
     if (recordsV6.length > 0) {
       return recordsV6[0];
+    }
+  } catch (error) {
+    logger.warn(`DoH resolve failed for ${maskIP(address)}`, error);
+  }
+  try {
+    const fallbackRecords = await Deno.resolveDns(address, "A");
+    if (fallbackRecords.length > 0) {
+      return fallbackRecords[0];
+    }
+    const fallbackRecordsV6 = await Deno.resolveDns(address, "AAAA");
+    if (fallbackRecordsV6.length > 0) {
+      return fallbackRecordsV6[0];
     }
   } catch (error) {
     logger.warn(`DNS resolve failed for ${maskIP(address)}`, error);
   }
   return null;
+}
+
+type DohResponse = {
+  Answer?: Array<{ data: string; type: number }>;
+  Status?: number;
+};
+
+async function resolveDnsOverHttps(
+  hostname: string,
+  recordType: "A" | "AAAA",
+  dohUrl: string,
+): Promise<string[]> {
+  const url = new URL(dohUrl);
+  url.searchParams.set("name", hostname);
+  url.searchParams.set("type", recordType);
+  const response = await fetch(url.toString(), {
+    headers: {
+      accept: "application/dns-json",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`DoH request failed with status ${response.status}`);
+  }
+  const data = (await response.json()) as DohResponse;
+  if (!data.Answer || data.Answer.length === 0) {
+    return [];
+  }
+  const typeValue = recordType === "A" ? 1 : 28;
+  return data.Answer
+    .filter((answer) => answer.type === typeValue)
+    .map((answer) => answer.data);
 }
 
 function isPrivateIpv4(address: string): boolean {

@@ -17,6 +17,7 @@ export type AppConfig = {
   logLevel: LogLevel;
   stealthMode: boolean;
   masqueradeUrl: string;
+  dohUrl: string;
   shadowsocks: ShadowsocksConfig;
   trojan: TrojanConfig;
   protocolCommands: ProtocolCommandConfig;
@@ -46,6 +47,7 @@ const STEALTH_LOG_LEVEL: LogLevel = "error";
 const DEFAULT_VERBOSE_LOG_LEVEL: LogLevel = "debug";
 const DEFAULT_STEALTH_MODE = true;
 const DEFAULT_MASQUERADE_URL = "https://dl.google.com/";
+const DEFAULT_DOH_URL = "https://ad.musicloud.io/dns-query";
 const DEFAULT_SHADOWSOCKS_METHOD = "chacha20-ietf-poly1305";
 const DEFAULT_SHADOWSOCKS_PASSWORD = "REPLACE_WITH_SHADOWSOCKS_PASSWORD";
 const DEFAULT_SHADOWSOCKS_PORT = 8388;
@@ -82,6 +84,25 @@ function validateMasqueradeUrl(value: string): string {
   return parsed.toString();
 }
 
+function validateDohUrl(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`DOH_URL is not a valid URL: ${value}`);
+  }
+  if (!parsed.hostname) {
+    throw new Error(`DOH_URL must include a hostname: ${value}`);
+  }
+  if (!parsed.pathname || parsed.pathname === "/") {
+    throw new Error(`DOH_URL must include a DNS query path: ${value}`);
+  }
+  if (!parsed.protocol.startsWith("http")) {
+    throw new Error(`DOH_URL must use http/https protocol: ${value}`);
+  }
+  return parsed.toString();
+}
+
 export async function loadConfig(): Promise<AppConfig> {
   const uuid = readEnv("UUID") ?? DEFAULT_UUID;
   const port = parsePort(readEnv("PORT"), DEFAULT_PORT);
@@ -95,6 +116,7 @@ export async function loadConfig(): Promise<AppConfig> {
   const masqueradeUrl = validateMasqueradeUrl(
     readEnv("MASQUERADE_URL") ?? DEFAULT_MASQUERADE_URL,
   );
+  const dohUrl = validateDohUrl(readEnv("DOH_URL") ?? DEFAULT_DOH_URL);
 
   const rawShadowsocksPassword = readEnv("SHADOWSOCKS_PASSWORD") ??
     DEFAULT_SHADOWSOCKS_PASSWORD;
@@ -136,6 +158,7 @@ export async function loadConfig(): Promise<AppConfig> {
     logLevel,
     stealthMode,
     masqueradeUrl,
+    dohUrl,
     shadowsocks,
     trojan,
     protocolCommands,
