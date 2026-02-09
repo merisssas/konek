@@ -40,11 +40,31 @@ function formatLogArgs(args: unknown[]): string {
       if (arg instanceof Error) {
         return maskIpInText(arg.stack ?? arg.message);
       }
+      if (
+        typeof arg === "object" &&
+        arg !== null &&
+        "message" in arg &&
+        typeof (arg as { message?: unknown }).message === "string"
+      ) {
+        return maskIpInText((arg as { message: string }).message);
+      }
+      if (
+        typeof arg === "object" &&
+        arg !== null &&
+        "name" in arg &&
+        typeof (arg as { name?: unknown }).name === "string"
+      ) {
+        return maskIpInText((arg as { name: string }).name);
+      }
       if (typeof arg === "string") {
         return maskIpInText(arg);
       }
       try {
-        return maskIpInText(JSON.stringify(arg));
+        const serialized = JSON.stringify(arg);
+        if (serialized === "{}") {
+          return maskIpInText(String(arg));
+        }
+        return maskIpInText(serialized);
       } catch {
         return maskIpInText(String(arg));
       }
