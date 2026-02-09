@@ -26,6 +26,8 @@ const TARPIT_CONFIG = {
   maxBytes: 300,
 };
 const MAX_WS_QUEUE_BYTES = 8 * 1024 * 1024;
+const UDP_IDLE_TIMEOUT_MS = 15_000;
+const UDP_IDLE_CHECK_INTERVAL_MS = 1_000;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -358,6 +360,32 @@ async function handleUdpPipe(
     transport: "udp",
     hostname: "0.0.0.0",
   });
+  let closed = false;
+  let lastActivity = Date.now();
+
+  const closeAll = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    try {
+      udpConn.close();
+    } catch (_) {}
+    try {
+      ws.close();
+    } catch (_) {}
+  };
+
+  const markActivity = () => {
+    lastActivity = Date.now();
+  };
+
+  const idleChecker = setInterval(() => {
+    if (Date.now() - lastActivity > UDP_IDLE_TIMEOUT_MS) {
+      logger.info("UDP idle timeout reached, closing connection.");
+      closeAll();
+    }
+  }, UDP_IDLE_CHECK_INTERVAL_MS);
 
   const wsToUdp = async () => {
     const reader = inputStream.getReader();
@@ -365,6 +393,7 @@ async function handleUdpPipe(
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+        markActivity();
         await udpConn.send(value, { transport: "udp", hostname: address, port });
       }
     } catch (error) {
@@ -377,6 +406,7 @@ async function handleUdpPipe(
   const udpToWs = async () => {
     try {
       for await (const [data] of udpConn) {
+        markActivity();
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(data);
         } else {
@@ -388,14 +418,12 @@ async function handleUdpPipe(
     }
   };
 
-  await Promise.race([wsToUdp(), udpToWs()]);
-
   try {
-    udpConn.close();
-  } catch (_) {}
-  try {
-    ws.close();
-  } catch (_) {}
+    await Promise.race([wsToUdp(), udpToWs()]);
+  } finally {
+    clearInterval(idleChecker);
+    closeAll();
+  }
 }
 
 function createCombinedStream(
