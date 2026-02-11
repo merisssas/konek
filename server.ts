@@ -790,6 +790,48 @@ v2ray
 ${vlessMain}
 ---------------------------------------------------------------
 ################################################################
+xray-core (ipv4 fallback)
+---------------------------------------------------------------
+{
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "${hostName}",
+            "port": ${port},
+            "users": [
+              {
+                "id": "${userID}",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "${hostName}",
+          "fingerprint": "chrome"
+        },
+        "wsSettings": {
+          "path": "/?ed=2048",
+          "headers": {
+            "Host": "${hostName}"
+          }
+        },
+        "sockopt": {
+          "domainStrategy": "UseIPv4"
+        }
+      }
+    }
+  ]
+}
+---------------------------------------------------------------
+################################################################
 clash-meta
 ---------------------------------------------------------------
 - type: vless
@@ -800,6 +842,7 @@ clash-meta
   network: ws
   tls: true
   udp: true
+  ip-version: ipv4
   sni: ${hostName}
   client-fingerprint: chrome
   ws-opts:
