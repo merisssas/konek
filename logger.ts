@@ -79,13 +79,21 @@ export type LoggerBundle = {
   errorLogBuffer: ErrorLogBuffer;
 };
 
-export function createLogger(level: LogLevel): LoggerBundle {
+export type LoggerOptions = {
+  sinkConsole?: boolean;
+};
+
+export function createLogger(
+  level: LogLevel,
+  options: LoggerOptions = {},
+): LoggerBundle {
+  const sinkConsole = options.sinkConsole ?? true;
   const errorLogBuffer = createErrorLogBuffer();
   const recordError = (...args: unknown[]) => {
     errorLogBuffer.add(formatLogEntry("error", args));
   };
 
-  if (level === "none") {
+  if (level === "none" || !sinkConsole) {
     return {
       logger: {
         debug: () => {},

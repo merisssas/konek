@@ -9,6 +9,7 @@ export type VlessServerOptions = {
   dohUrl: string | null;
   errorLogBuffer: ErrorLogBuffer;
   logger?: Logger;
+  zeroDiskMode?: boolean;
 };
 
 const textDecoder = new TextDecoder();
@@ -880,6 +881,7 @@ function formatServerInfo(options: VlessServerOptions): string {
       uuid: options.uuid,
       masqueradeUrl: options.masqueradeUrl,
       dohUrl: options.dohUrl,
+      zeroDiskMode: Boolean(options.zeroDiskMode),
     },
     errors: {
       count: options.errorLogBuffer.size(),

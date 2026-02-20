@@ -14,6 +14,7 @@ startVlessServer({
   dohUrl: config.dohUrl,
   errorLogBuffer: config.errorLogBuffer,
   logger: config.logger,
+  zeroDiskMode: config.zeroDiskMode,
 });
 
 function registerGlobalErrorHandlers(logger: Logger): void {
